@@ -7443,17 +7443,27 @@ class SensitiveManagerDialog(QDialog):
         gp.addRow("ยืนยัน:", self.ed_pw2)
         data = _sensitive_load()
         has_pw = bool(data.get("password_hash"))
-        lbl_pw_status = QLabel("🔒 ตั้งรหัสไว้แล้ว" if has_pw else "⚠️ ยังไม่ได้ตั้งรหัส")
-        lbl_pw_status.setStyleSheet(
+        self.lbl_pw_status = QLabel("🔒 ตั้งรหัสไว้แล้ว" if has_pw else "⚠️ ยังไม่ได้ตั้งรหัส")
+        self.lbl_pw_status.setStyleSheet(
             f"color:{'#16a34a' if has_pw else '#dc2626'};font-weight:600;font-size:12px;")
-        gp.addRow("สถานะ:", lbl_pw_status)
+        gp.addRow("สถานะ:", self.lbl_pw_status)
+        pw_btn_row = QHBoxLayout()
         self.btn_set_pw = QPushButton("💾 บันทึกรหัสผ่าน")
         self.btn_set_pw.setStyleSheet(
             "QPushButton{background:#2563eb;color:white;border:none;border-radius:5px;"
             "padding:5px 16px;font-weight:600;}"
             "QPushButton:hover{background:#1d4ed8;}")
         self.btn_set_pw.clicked.connect(self._save_password)
-        gp.addRow("", self.btn_set_pw)
+        self.btn_reset_pw = QPushButton("🔄 รีเซ็ตรหัสผ่าน")
+        self.btn_reset_pw.setStyleSheet(
+            "QPushButton{background:#fee2e2;color:#dc2626;border:1px solid #dc2626;"
+            "border-radius:5px;padding:5px 16px;font-weight:600;}"
+            "QPushButton:hover{background:#fecaca;}")
+        self.btn_reset_pw.clicked.connect(self._reset_password)
+        pw_btn_row.addWidget(self.btn_set_pw)
+        pw_btn_row.addWidget(self.btn_reset_pw)
+        pw_btn_row.addStretch()
+        gp.addRow("", pw_btn_row)
         lay.addWidget(grp_pw)
 
         # ── ส่วนรายชื่อ ──
@@ -7461,7 +7471,7 @@ class SensitiveManagerDialog(QDialog):
         gn = QVBoxLayout(grp_names)
         gn.setSpacing(6)
 
-        hint = QLabel("ชื่อผู้รับเงิน/Vendor ที่ตรงกันจะแสดงยอดเป็น ●●●●● ในตารางคิวจ่ายเงิน")
+        hint = QLabel("ชื่อผู้รับเงิน/Vendor ที่ตรงกันจะแสดงยอดเป็น ●●●●● ในหน้าตัดบิล (จับคู่สลิป)")
         hint.setStyleSheet("color:#64748b;font-size:11px;")
         hint.setWordWrap(True)
         gn.addWidget(hint)
@@ -7551,7 +7561,30 @@ class SensitiveManagerDialog(QDialog):
         data["password_hash"] = _sensitive_hash(pw1)
         _sensitive_save(data)
         self.ed_pw1.clear(); self.ed_pw2.clear()
+        self.lbl_pw_status.setText("🔒 ตั้งรหัสไว้แล้ว")
+        self.lbl_pw_status.setStyleSheet("color:#16a34a;font-weight:600;font-size:12px;")
         QMessageBox.information(self, "บันทึกแล้ว", "ตั้งรหัสผ่านใหม่เรียบร้อย")
+
+    def _reset_password(self):
+        data = _sensitive_load()
+        if not data.get("password_hash"):
+            QMessageBox.information(self, "รีเซ็ตรหัสผ่าน", "ยังไม่ได้ตั้งรหัสผ่านไว้")
+            return
+        ok = QMessageBox.question(
+            self, "ยืนยันรีเซ็ตรหัสผ่าน",
+            "ต้องการลบรหัสผ่านปัจจุบันใช่ไหม?\n"
+            "หลังรีเซ็ต ยอดเงินที่ซ่อนไว้จะดูไม่ได้จนกว่าจะตั้งรหัสใหม่",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if ok != QMessageBox.StandardButton.Yes:
+            return
+        data["password_hash"] = ""
+        _sensitive_save(data)
+        self.ed_pw1.clear(); self.ed_pw2.clear()
+        self.lbl_pw_status.setText("⚠️ ยังไม่ได้ตั้งรหัส")
+        self.lbl_pw_status.setStyleSheet("color:#dc2626;font-weight:600;font-size:12px;")
+        QMessageBox.information(self, "รีเซ็ตแล้ว",
+            "ลบรหัสผ่านเรียบร้อย — กรุณาตั้งรหัสใหม่เพื่อใช้งานการดูยอดเงิน")
 
     def _add_name(self):
         name = self.ed_name.text().strip()
@@ -8383,10 +8416,13 @@ class MainWindow(QMainWindow):
             return
         dlg = SensitiveManagerDialog(self)
         dlg.exec()
-        # หลังปิด dialog → refresh ตารางคิวให้แสดง mask ที่อัปเดตแล้ว
-        if hasattr(self, "queue_tab"):
-            self.queue_tab._revealed_ids.clear()   # reset unlock ทั้งหมด
-            self.queue_tab._apply_filter()
+        # หลังปิด dialog → refresh หน้าตัดบิลให้แสดง mask ที่อัปเดตแล้ว
+        try:
+            if getattr(self, "slip_tab", None) and self.slip_tab._results:
+                self.slip_tab._revealed_slip_ids.clear()   # reset unlock ทั้งหมด
+                self.slip_tab._render_results()
+        except Exception:
+            pass
 
     def _open_user_manager(self):
         # user ทั่วไปห้ามเข้าเด็ดขาด
