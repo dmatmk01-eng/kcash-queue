@@ -2422,10 +2422,18 @@ def _sensitive_save(data: dict):
 def _sensitive_hash(pw: str) -> str:
     return hashlib.sha256(pw.encode("utf-8")).hexdigest()
 
+def _sensitive_norm(s: str) -> str:
+    """normalize ชื่อ — รวมช่องว่าง/บรรทัดใหม่ให้เหลือช่องว่างเดียว + ตัดคำนำหน้าทั่วไป
+    เพื่อให้จับคู่ได้แม้พิมพ์มี/ไม่มีคำนำหน้า หรือมีช่องว่างต่างกัน"""
+    s = re.sub(r"\s+", " ", (s or "")).strip().lower()
+    # ตัดคำนำหน้าชื่อไทย/ย่อ (น.ส./นาย/นาง/บจก./บริษัท ฯลฯ) ออกหัวข้อความ
+    s = re.sub(r"^(น\.ส\.|นางสาว|นาย|นาง|ด\.ช\.|ด\.ญ\.|บจก\.|บมจ\.|หจก\.|บริษัท|ห้างหุ้นส่วน)\s*", "", s)
+    return s.strip()
+
 def _sensitive_names() -> set:
-    """คืนเซตชื่อ (lowercase stripped) ที่ต้องซ่อนยอดเงิน"""
+    """คืนเซตชื่อ (normalize แล้ว) ที่ต้องซ่อนยอดเงิน"""
     data = _sensitive_load()
-    return {n.strip().lower() for n in (data.get("names") or []) if n.strip()}
+    return {_sensitive_norm(n) for n in (data.get("names") or []) if _sensitive_norm(n)}
 
 def _sensitive_check_pw(pw: str) -> bool:
     data = _sensitive_load()
@@ -2433,7 +2441,19 @@ def _sensitive_check_pw(pw: str) -> bool:
     return bool(h) and _sensitive_hash(pw) == h
 
 def _sensitive_is_vendor(vendor_name: str, names_set: set) -> bool:
-    return bool(names_set) and (vendor_name or "").strip().lower() in names_set
+    """จับคู่แบบยืดหยุ่น — ตรงกัน หรือชื่อหนึ่งเป็นส่วนหนึ่งของอีกชื่อ
+    (เผื่อสลิปมีคำนำหน้า/วงเล็บ/ชื่อเล่นต่างจากที่กรอกไว้)"""
+    if not names_set:
+        return False
+    v = _sensitive_norm(vendor_name)
+    if not v:
+        return False
+    for n in names_set:
+        if not n:
+            continue
+        if n == v or n in v or v in n:
+            return True
+    return False
 
 
 class QueueTab(QWidget):
@@ -7478,10 +7498,14 @@ class SensitiveManagerDialog(QDialog):
 
         self.lst = QListWidget()
         self.lst.setAlternatingRowColors(True)
+        self.lst.setWordWrap(False)   # ชื่อแสดงบรรทัดเดียว ไม่ตัดบรรทัด
         self.lst.setStyleSheet("font-size:13px;")
+        _seen = set()
         for n in (data.get("names") or []):
-            if n.strip():
-                self.lst.addItem(n.strip())
+            nm = re.sub(r"\s+", " ", n).strip()   # รวมช่องว่าง/บรรทัดใหม่ → บรรทัดเดียว
+            if nm and nm.lower() not in _seen:
+                self.lst.addItem(nm)
+                _seen.add(nm.lower())
         gn.addWidget(self.lst, 1)
 
         bar_add = QHBoxLayout()
@@ -7587,7 +7611,7 @@ class SensitiveManagerDialog(QDialog):
             "ลบรหัสผ่านเรียบร้อย — กรุณาตั้งรหัสใหม่เพื่อใช้งานการดูยอดเงิน")
 
     def _add_name(self):
-        name = self.ed_name.text().strip()
+        name = re.sub(r"\s+", " ", self.ed_name.text()).strip()
         if not name:
             return
         # ตรวจซ้ำ
@@ -7620,7 +7644,7 @@ class SensitiveManagerDialog(QDialog):
         added = 0
         for ln in lines:
             # รองรับ CSV — เอาคอลัมน์แรก
-            name = ln.split(",")[0].strip().strip('"')
+            name = re.sub(r"\s+", " ", ln.split(",")[0].strip().strip('"')).strip()
             if name and name.lower() not in existing:
                 self.lst.addItem(name)
                 existing.add(name.lower())
@@ -7637,13 +7661,29 @@ class SensitiveManagerDialog(QDialog):
             self._update_count()
 
     def _save_names(self):
-        names = [self.lst.item(i).text() for i in range(self.lst.count())]
+        names = [re.sub(r"\s+", " ", self.lst.item(i).text()).strip()
+                 for i in range(self.lst.count())]
+        names = [n for n in names if n]
         data = _sensitive_load()
         data["names"] = names
         _sensitive_save(data)
+        # refresh หน้าตัดบิลทันที (ไม่ต้องปิด/เปิดใหม่)
+        self._refresh_slip_tab()
         QMessageBox.information(self, "บันทึกแล้ว",
             f"บันทึกรายชื่อ {len(names)} รายการเรียบร้อย\n"
-            "ยอดเงินของรายชื่อเหล่านี้จะถูกซ่อนในตารางคิวจ่ายเงิน")
+            "ยอดเงินของรายชื่อเหล่านี้จะถูกซ่อนในหน้าตัดบิล (จับคู่สลิป)")
+
+    def _refresh_slip_tab(self):
+        """สั่งหน้าตัดบิลของ MainWindow ให้ render ใหม่เพื่อใช้ mask ล่าสุด"""
+        try:
+            w = self.parent()
+            while w is not None and not hasattr(w, "slip_tab"):
+                w = w.parent()
+            if w is not None and getattr(w, "slip_tab", None) and w.slip_tab._results:
+                w.slip_tab._revealed_slip_ids.clear()
+                w.slip_tab._render_results()
+        except Exception:
+            pass
 
     def _update_count(self):
         self.lbl_count.setText(f"{self.lst.count()} รายชื่อ")
