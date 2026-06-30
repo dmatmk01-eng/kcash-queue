@@ -7704,7 +7704,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "1.5"
+APP_VERSION = "1.8"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -7875,6 +7875,19 @@ CHANGELOG = [
             "เมนู 'ช่วยเหลือ → ตรวจหาอัปเดต' สำหรับเช็คด้วยตัวเอง",
             "หน้าตัดบิล: แท็บ 'ทั้งหมด' ย้ายเป็นแท็บแรก + มี popup โหลดตอนนำเข้า PDF",
             "แก้การ Sort ยอดเงินในคิวจ่ายเงินให้เรียงตัวเลขถูกต้อง",
+        ],
+    },
+    {
+        "version": "1.8",
+        "date": "30/06/2569",
+        "title": "บังคับอัปเดตอัตโนมัติ + ปรับขนาดคอลัมน์อิสระ + ปรับปรุงข้อมูลลับ",
+        "items": [
+            "บังคับอัปเดตอัตโนมัติ — เมื่อมีเวอร์ชันใหม่ โปรแกรมจะแจ้งเตือนและอัปเดตให้ทันที (ไม่ต้องส่งไฟล์เอง)",
+            "ตอนอัปเดต เก็บข้อมูลผู้ใช้/รหัสผ่าน/ตั้งค่าทั้งหมดไว้ — ไม่ต้องสมัครหรือตั้งค่าใหม่",
+            "ทุกตาราง (คิวจ่ายเงิน/ตัดบิล/Statement) ลากปรับขนาดคอลัมน์ได้อิสระทุกช่อง",
+            "ข้อมูลลับ: จับคู่ชื่อยืดหยุ่นขึ้น (ไม่ติดคำนำหน้า/ช่องว่าง) + กดบันทึกแล้วซ่อนทันที",
+            "เพิ่มปุ่ม 'รีเซ็ตรหัสผ่าน' ในหน้าจัดการข้อมูลลับ",
+            "รายชื่อข้อมูลลับแสดงบรรทัดเดียว ไม่ตัดบรรทัด",
         ],
     },
 ]
@@ -8317,17 +8330,24 @@ class MainWindow(QMainWindow):
         note_txt = (notes or "").strip()
         if len(note_txt) > 600:
             note_txt = note_txt[:600] + "..."
+        # บังคับอัปเดต — แจ้งเตือนแล้วอัปเดตให้ทันที (ปุ่มเดียว ปิดหน้าต่างไม่ได้)
         box = QMessageBox(self)
-        box.setWindowTitle("มีเวอร์ชันใหม่")
+        box.setWindowTitle("จำเป็นต้องอัปเดต")
         box.setIcon(QMessageBox.Icon.Information)
-        box.setText(f"มีเวอร์ชันใหม่ <b>v{version}</b> (ปัจจุบัน v{APP_VERSION})")
+        box.setText(
+            f"มีเวอร์ชันใหม่ <b>v{version}</b> (ปัจจุบัน v{APP_VERSION})<br>"
+            "ต้องอัปเดตเป็นเวอร์ชันล่าสุดก่อนใช้งาน<br>"
+            "<span style='color:#16a34a'>ข้อมูลผู้ใช้/รหัสผ่าน/ตั้งค่าทั้งหมดจะถูกเก็บไว้</span>")
         if note_txt:
             box.setInformativeText("สิ่งที่เปลี่ยน:\n" + note_txt)
-        b_yes = box.addButton("⬇️ อัปเดตเลย", QMessageBox.ButtonRole.AcceptRole)
-        box.addButton("ไว้ทีหลัง", QMessageBox.ButtonRole.RejectRole)
+        box.setStandardButtons(QMessageBox.StandardButton.NoButton)
+        box.addButton("⬇️ อัปเดตเดี๋ยวนี้", QMessageBox.ButtonRole.AcceptRole)
+        # ถอดปุ่ม X เพื่อบังคับให้กดอัปเดต (กันปิดเลี่ยง)
+        box.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        box.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
         box.exec()
-        if box.clickedButton() is b_yes:
-            self._start_update_download(version, url)
+        # บังคับ: ไม่ว่าจะปิดด้วยวิธีใด → เริ่มดาวน์โหลด/อัปเดตเสมอ
+        self._start_update_download(version, url)
 
     def _start_update_download(self, version, url):
         dlg = LoadingDialog(f"กำลังดาวน์โหลดเวอร์ชัน v{version}...", self)
@@ -8379,8 +8399,8 @@ class MainWindow(QMainWindow):
 
         # ไฟล์ข้อมูลผู้ใช้ที่ต้องไม่เขียนทับ (robocopy /XF)
         keep = ("kcash_config.json kcash_users.dat kcash_remember.dat "
-                "account_memory.json kcash_remarks.json queue_plan.json "
-                "rejected.json paid_pending.json activity_log.json "
+                "kcash_sensitive.json account_memory.json kcash_remarks.json "
+                "queue_plan.json rejected.json paid_pending.json activity_log.json "
                 "queue_log.json share_links.json")
         bat = os.path.join(tempfile.gettempdir(), "kcash_update.bat")
         bat_src = (
