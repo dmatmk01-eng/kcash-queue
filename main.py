@@ -2721,10 +2721,13 @@ class QueueTab(QWidget):
         # ── Table ──
         self.table = QTableWidget(0, len(self.COLS))
         self.table.setHorizontalHeaderLabels(self.COLS)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        _qhh = self.table.horizontalHeader()
+        _qhh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)  # ทุกคอลัมน์ลากปรับขนาดได้อิสระ
+        _qhh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)     # ช่องติ๊ก คงที่
+        _qhh.setStretchLastSection(False)
         self.table.setColumnWidth(0, 34)
         self.table.setColumnWidth(1, 150)   # เลขที่เอกสาร (กว้างพอ ไม่ตัดเป็น ...)
+        self.table.setColumnWidth(2, 260)   # ผู้รับเงิน/Vendor (กว้างเริ่มต้น ลากปรับได้)
         self.table.setColumnWidth(3, 110)   # แบรนด์
         self.table.setColumnWidth(4, 100)   # ครบกำหนด
         self.table.setColumnWidth(5, 100)   # วันที่จ่าย
@@ -5075,7 +5078,9 @@ class StatementTab(QWidget):
 
         self.match_table = QTableWidget(0, len(self.MATCH_COLS))
         self.match_table.setHorizontalHeaderLabels(self.MATCH_COLS)
-        self.match_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.match_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.match_table.horizontalHeader().setStretchLastSection(False)
+        self.match_table.setColumnWidth(1, 240)
         self.match_table.verticalHeader().setVisible(False)
         self.match_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.match_table.setAlternatingRowColors(True)
@@ -5084,7 +5089,9 @@ class StatementTab(QWidget):
 
         self.stmt_table = QTableWidget(0, len(self.STMT_COLS))
         self.stmt_table.setHorizontalHeaderLabels(self.STMT_COLS)
-        self.stmt_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.stmt_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.stmt_table.horizontalHeader().setStretchLastSection(False)
+        self.stmt_table.setColumnWidth(1, 240)
         self.stmt_table.verticalHeader().setVisible(False)
         self.stmt_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.stmt_table.setAlternatingRowColors(True)
@@ -5577,14 +5584,17 @@ class SlipMatchTab(QWidget):
 
         self.table_un = QTableWidget(0, len(self.COLS_UN))
         self.table_un.setHorizontalHeaderLabels(self.COLS_UN)
-        self.table_un.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        self.table_un.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        self.table_un.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        _uhh = self.table_un.horizontalHeader()
+        _uhh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)  # ลากปรับขนาดได้อิสระ
+        _uhh.setStretchLastSection(False)
         self.table_un.setColumnWidth(0, 34)    # ✓
         self.table_un.setColumnWidth(1, 40)    # #
         self.table_un.setColumnWidth(2, 90)    # วันที่จ่าย
+        self.table_un.setColumnWidth(3, 220)   # ชื่อผู้รับ (สลิป)
         self.table_un.setColumnWidth(4, 100)   # ยอด
+        self.table_un.setColumnWidth(5, 220)   # รายละเอียด
         self.table_un.setColumnWidth(6, 120)   # EXP ที่ระบบเดา
+        self.table_un.setColumnWidth(7, 200)   # ชื่อในระบบ
         self.table_un.setColumnWidth(8, 140)   # สถานะ
         self.table_un.setColumnWidth(9, 130)   # ดูใน FlowAccount
         self.table_un.setColumnWidth(10, 80)   # รูป
@@ -5605,13 +5615,16 @@ class SlipMatchTab(QWidget):
         """สร้างตารางผลจับคู่ (คอลัมน์ COLS) — ใช้ทั้งหน้า 'เตรียมดำเนินการ' และ 'ทั้งหมด'"""
         t = QTableWidget(0, len(self.COLS))
         t.setHorizontalHeaderLabels(self.COLS)
-        t.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        t.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        _thh = t.horizontalHeader()
+        _thh.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)  # ลากปรับขนาดได้อิสระ
+        _thh.setStretchLastSection(False)
         t.setColumnWidth(0, 34)    # ✓
         t.setColumnWidth(1, 40)    # #
         t.setColumnWidth(2, 90)    # วันที่จ่าย
+        t.setColumnWidth(3, 220)   # ชื่อผู้รับ (สลิป)
         t.setColumnWidth(4, 100)   # ยอด
         t.setColumnWidth(5, 120)   # จับคู่กับ EXP
+        t.setColumnWidth(6, 200)   # ชื่อในระบบ
         t.setColumnWidth(7, 110)   # แบรนด์
         t.setColumnWidth(8, 60)    # คะแนน
         t.setColumnWidth(9, 130)   # สถานะ
