@@ -134,35 +134,61 @@ def crop_all_rows(pdf_path: str, records: list, scale: float = 2.5) -> list:
     """
     import io
     from collections import defaultdict
-    import pypdfium2 as pdfium
 
     out = [None] * len(records)
-    by_page = defaultdict(list)
-    for idx, r in enumerate(records):
-        by_page[int(r.get("page", 1)) - 1].append(idx)
 
-    pdf = pdfium.PdfDocument(pdf_path)
-    try:
-        for pno, idxs in by_page.items():
-            try:
-                pil = pdf[pno].render(scale=scale).to_pil()
+    # (ก) รายการที่มาจาก 'ไฟล์รูปภาพ' (มี _img_path) → ใช้รูปนั้นเป็นหลักฐานโดยตรง
+    #     (แปลงเป็น PNG ให้เรียบร้อย) — ไม่ต้องตัดจาก PDF
+    pdf_idxs = []
+    for idx, r in enumerate(records):
+        ip = r.get("_img_path")
+        if not ip:
+            pdf_idxs.append(idx)
+            continue
+        try:
+            from PIL import Image
+            im = Image.open(ip)
+            im.load()
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGB")
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            out[idx] = buf.getvalue()
+        except Exception:
+            try:                       # อ่านด้วย PIL ไม่ได้ → อ่านไฟล์ดิบ (เผื่อเป็น PNG อยู่แล้ว)
+                with open(ip, "rb") as _f:
+                    out[idx] = _f.read()
             except Exception:
-                continue
-            W, H = pil.size
-            for idx in idxs:
-                r = records[idx]
-                yt = float(r.get("y_top", 0))
-                yb = float(r.get("y_bottom", yt + 40))
-                y0 = max(0, int((yt - 4) * scale))
-                y1 = min(H, int((yb + 4) * scale))
-                if y1 <= y0:
-                    y1 = min(H, y0 + int(40 * scale))
-                buf = io.BytesIO()
-                pil.crop((0, y0, W, y1)).save(buf, format="PNG")
-                out[idx] = buf.getvalue()
-        return out
-    finally:
-        pdf.close()
+                out[idx] = None
+
+    # (ข) รายการจาก PDF → ตัดทีละแถวจากหน้า PDF (เหมือนเดิม)
+    if pdf_idxs and pdf_path:
+        import pypdfium2 as pdfium
+        by_page = defaultdict(list)
+        for idx in pdf_idxs:
+            by_page[int(records[idx].get("page", 1)) - 1].append(idx)
+        pdf = pdfium.PdfDocument(pdf_path)
+        try:
+            for pno, idxs in by_page.items():
+                try:
+                    pil = pdf[pno].render(scale=scale).to_pil()
+                except Exception:
+                    continue
+                W, H = pil.size
+                for idx in idxs:
+                    r = records[idx]
+                    yt = float(r.get("y_top", 0))
+                    yb = float(r.get("y_bottom", yt + 40))
+                    y0 = max(0, int((yt - 4) * scale))
+                    y1 = min(H, int((yb + 4) * scale))
+                    if y1 <= y0:
+                        y1 = min(H, y0 + int(40 * scale))
+                    buf = io.BytesIO()
+                    pil.crop((0, y0, W, y1)).save(buf, format="PNG")
+                    out[idx] = buf.getvalue()
+        finally:
+            pdf.close()
+    return out
 
 
 def _collect(band, xrng, ytop=None, ybot=None):

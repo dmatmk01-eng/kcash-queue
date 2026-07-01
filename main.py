@@ -5297,6 +5297,28 @@ class SlipPDFWorker(QThread):
             self.error.emit(str(exc))
 
 
+class SlipImageWorker(QThread):
+    """อ่านสลิปจาก 'รูปภาพ' หลายไฟล์ด้วย OCR (Windows OCR) + PDF (ถ้ามี) — background
+    บัญชีเขียนแท็ก 'ai#EXP<เลข>' ในรูป → อ่านเลข EXP ไปจับคู่แบบเลขตรง"""
+    done  = pyqtSignal(list)
+    error = pyqtSignal(str)
+    def __init__(self, img_paths, pdf_path=None, parent=None):
+        super().__init__(parent)
+        self.img_paths = img_paths
+        self.pdf_path = pdf_path
+    def run(self):
+        try:
+            import slip_ocr
+            recs = []
+            if self.pdf_path:                       # เผื่อเลือก PDF ปนกับรูป
+                recs.extend(parse_payment_report(self.pdf_path))
+            for p in self.img_paths:
+                recs.append(slip_ocr.parse_slip_image(p))
+            self.done.emit(recs)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class SlipAttachWorker(QThread):
     """ตัดบิลเป็นรูป + แนบเข้า FlowAccount + เปลี่ยนสถานะเป็นจ่ายแล้ว (background) — Phase 2"""
     progress = pyqtSignal(int, int)
@@ -5499,7 +5521,7 @@ class SlipMatchTab(QWidget):
         layout.setSpacing(6)
 
         tb = QHBoxLayout()
-        self.btn_open = QPushButton("📂 เลือกไฟล์สลิป PDF")
+        self.btn_open = QPushButton("📂 เลือกไฟล์สลิป PDF/รูปภาพ")
         self.btn_match = QPushButton("🔗 จับคู่")
         self.btn_savepng = QPushButton("✂️ ตัดบิลเป็นรูป (ลงโฟลเดอร์)")
         self.btn_attach = QPushButton("📎 ตัดบิล + แนบเข้า FlowAccount")
@@ -5669,27 +5691,49 @@ class SlipMatchTab(QWidget):
         self._expenses = expenses or []
 
     def _open_pdf(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "เลือกไฟล์สลิป PDF จากธนาคาร", "", "PDF Files (*.pdf)")
-        if not path:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "เลือกไฟล์สลิป — PDF หรือรูปภาพ (เลือกได้หลายไฟล์)", "",
+            "สลิปทั้งหมด (*.pdf *.png *.jpg *.jpeg *.bmp);;"
+            "PDF (*.pdf);;รูปภาพ (*.png *.jpg *.jpeg *.bmp)")
+        if not paths:
+            return
+        _IMG = (".png", ".jpg", ".jpeg", ".bmp")
+        imgs = [p for p in paths if p.lower().endswith(_IMG)]
+        pdfs = [p for p in paths if p.lower().endswith(".pdf")]
+        if not imgs and not pdfs:
+            QMessageBox.information(self, "ไฟล์ไม่รองรับ", "รองรับเฉพาะ PDF หรือรูปภาพ")
             return
         self._clear_slip_images()
-        self._pdf_path = path
+        self._pdf_path = pdfs[0] if pdfs else None   # ใช้ตัดรูปแถว PDF (รูปภาพใช้ไฟล์เอง)
+        # ป้ายชื่อไฟล์
+        if imgs and pdfs:
+            label = f"{len(pdfs)} PDF + {len(imgs)} รูป"
+        elif imgs:
+            label = (os.path.basename(imgs[0]) if len(imgs) == 1 else f"{len(imgs)} รูปภาพ")
+        else:
+            label = (os.path.basename(pdfs[0]) if len(pdfs) == 1 else f"{len(pdfs)} ไฟล์ PDF")
         self.lbl_file.setText("กำลังอ่านสลิป…")
-        dlg = LoadingDialog("กำลังอ่านไฟล์สลิป PDF...", self)
-        dlg.set_indeterminate("กำลังอ่านไฟล์สลิป PDF...")
-        self._pdf_worker = SlipPDFWorker(path, self)
-        self._pdf_worker.done.connect(lambda recs: (dlg.accept(), self._on_pdf_loaded(path, recs)))
-        self._pdf_worker.error.connect(lambda msg: (dlg.reject(), self._on_pdf_error(msg)))
-        self._pdf_worker.start()
+        use_ocr = bool(imgs)
+        msg = ("กำลังอ่านสลิปจากรูป (OCR อาจใช้เวลาเล็กน้อย)..."
+               if use_ocr else "กำลังอ่านไฟล์สลิป PDF...")
+        dlg = LoadingDialog(msg, self)
+        dlg.set_indeterminate(msg)
+        if use_ocr:
+            self._slip_worker = SlipImageWorker(imgs, pdfs[0] if pdfs else None, self)
+        else:
+            self._slip_worker = SlipPDFWorker(pdfs[0], self)
+        self._slip_worker.done.connect(
+            lambda recs: (dlg.accept(), self._on_pdf_loaded(label, recs)))
+        self._slip_worker.error.connect(
+            lambda m: (dlg.reject(), self._on_pdf_error(m)))
+        self._slip_worker.start()
         dlg.exec()
 
-    def _on_pdf_loaded(self, path, records):
+    def _on_pdf_loaded(self, label, records):
         self._records = records
-        total = sum(r["amount"] for r in self._records)
+        total = sum((r.get("amount") or 0) for r in self._records)
         self.lbl_file.setText(
-            f"{os.path.basename(path)} • {len(self._records)} รายการ • "
-            f"{fmt_amount(total)} บาท")
+            f"{label} • {len(self._records)} รายการ • {fmt_amount(total)} บาท")
         self.btn_match.setEnabled(bool(self._records))
         self.btn_savepng.setEnabled(bool(self._records))
         self.status_message.emit(f"อ่านสลิปได้ {len(self._records)} รายการ")
@@ -5760,8 +5804,11 @@ class SlipMatchTab(QWidget):
         self._render_results()
 
     def _crop_slip_images(self):
-        """ตัดรูปสลิปทุกแถว เก็บใน RAM (slip['_png']) — กดดูในโปรแกรมได้"""
-        if not (self._records and self._pdf_path):
+        """ตัดรูปสลิปทุกแถว เก็บใน RAM (slip['_png']) — กดดูในโปรแกรมได้
+        (รายการจากรูปภาพใช้ไฟล์รูปเองผ่าน _img_path — ไม่ต้องมี PDF)"""
+        if not self._records:
+            return
+        if not self._pdf_path and not any(r.get("_img_path") for r in self._records):
             return
         self.status_message.emit("กำลังตัดรูปสลิปเพื่อแสดง…")
         QApplication.processEvents()
@@ -7728,7 +7775,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -7973,6 +8020,18 @@ CHANGELOG = [
             "ยอดเท่ากันหลายใบ + ชื่อแยกไม่ออก → ไม่เดา ขึ้น 'ต้องยืนยัน' ให้เลือกเอง",
             "กันบัญชี 'คนกลาง' (1 บัญชีจ่ายหลายผู้ขาย) ไม่ให้จับเขียวอัตโนมัติ",
             "ผลรวม: สิ่งที่ขึ้นเขียว = เชื่อถือได้ ส่วนที่ไม่ชัวร์ให้คนยืนยันก่อน ไม่บันทึกผิดเอง",
+        ],
+    },
+    {
+        "version": "2.3.0",
+        "date": "01/07/2569",
+        "title": "ตัดบิลจากรูปภาพได้ (อ่านแท็ก ai#EXP อัตโนมัติ)",
+        "items": [
+            "รองรับสลิปเป็น 'รูปภาพ' (PNG/JPG) ไม่ใช่แค่ PDF — เลือกได้หลายรูปพร้อมกัน",
+            "ปุ่มเปลี่ยนเป็น 'เลือกไฟล์สลิป PDF/รูปภาพ'",
+            "อ่านแท็ก 'ai#EXP<เลข>' ที่บัญชีเขียนในรูปด้วย OCR (Windows) → จับคู่เลขเอกสารตรงเป๊ะอัตโนมัติ",
+            "อ่านยอดเงิน/วันที่จากรูปให้ด้วย + ใช้รูปเป็นหลักฐานแนบเข้า FlowAccount",
+            "ถ้า OCR อ่านไม่ได้/ไม่เจอเลข → ขึ้น 'ต้องยืนยัน' ให้จับคู่เอง (ไม่เดา)",
         ],
     },
 ]
