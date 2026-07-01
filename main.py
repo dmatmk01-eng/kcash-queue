@@ -7611,7 +7611,7 @@ class SensitiveManagerDialog(QDialog):
             "QPushButton{background:#dc2626;color:white;border:none;border-radius:5px;padding:5px 12px;}"
             "QPushButton:hover{background:#b91c1c;}")
         btn_del.clicked.connect(self._del_selected)
-        btn_import = QPushButton("📂 Import จากไฟล์ (.txt/.csv)")
+        btn_import = QPushButton("📂 Import จากไฟล์ (Excel/.csv/.txt)")
         btn_import.setStyleSheet(
             "QPushButton{background:#f1f5f9;border:1px solid #cbd5e1;border-radius:5px;"
             "padding:5px 12px;color:#334155;}"
@@ -7715,27 +7715,75 @@ class SensitiveManagerDialog(QDialog):
     def _import_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "เลือกไฟล์รายชื่อ", "",
-            "Text/CSV Files (*.txt *.csv);;All Files (*)")
+            "รายชื่อ (*.xlsx *.csv *.txt);;Excel (*.xlsx);;"
+            "Text/CSV (*.txt *.csv);;All Files (*)")
         if not path:
             return
         try:
-            with open(path, encoding="utf-8-sig") as f:
-                lines = [l.strip() for l in f if l.strip()]
+            if path.lower().endswith(".xlsx"):
+                names = self._names_from_xlsx(path)   # Excel HR export
+            else:
+                with open(path, encoding="utf-8-sig") as f:
+                    names = [re.sub(r"\s+", " ", l.split(",")[0].strip().strip('"')).strip()
+                             for l in f if l.strip()]
         except Exception as e:
             QMessageBox.critical(self, "อ่านไฟล์ไม่ได้", str(e))
             return
+        if not names:
+            QMessageBox.warning(self, "ไม่พบรายชื่อ",
+                "อ่านไฟล์ได้ แต่หาคอลัมน์ชื่อ/นามสกุลไม่เจอ\n"
+                "(ไฟล์ Excel ควรมีหัวคอลัมน์ 'ชื่อ' และ 'นามสกุล')")
+            return
         existing = {self.lst.item(i).text().lower() for i in range(self.lst.count())}
         added = 0
-        for ln in lines:
-            # รองรับ CSV — เอาคอลัมน์แรก
-            name = re.sub(r"\s+", " ", ln.split(",")[0].strip().strip('"')).strip()
+        for name in names:
             if name and name.lower() not in existing:
                 self.lst.addItem(name)
                 existing.add(name.lower())
                 added += 1
         self._update_count()
         QMessageBox.information(self, "Import สำเร็จ",
-            f"เพิ่มรายชื่อใหม่ {added} รายการ (ข้ามที่ซ้ำ)")
+            f"เพิ่มรายชื่อใหม่ {added} รายการ (ข้ามที่ซ้ำ)\n"
+            f"จากทั้งหมดในไฟล์ {len(names)} ชื่อ")
+
+    def _names_from_xlsx(self, path):
+        """ดึงชื่อจากไฟล์ Excel (รายชื่อพนักงานจาก HR) — หาคอลัมน์ 'ชื่อ'/'นามสกุล'
+        (ไทย+อังกฤษ) จากหัวตารางอัตโนมัติ → คืนชื่อเต็ม (ไม่เอาชื่อเล่น เพราะสั้น/โหล
+        เสี่ยงบังเอิญตรงผู้ขายอื่น = ซ่อนยอดผิดคน). รองรับหลายชีต + ไฟล์อนาคตรูปแบบเดิม"""
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        out = []
+        for ws in wb.worksheets:
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                continue
+            # หาแถวหัวตาราง (มีทั้ง 'ชื่อ' และ 'นามสกุล')
+            hdr = None
+            for row in rows[:15]:
+                cells = [str(c).strip() if c is not None else "" for c in row]
+                if "ชื่อ" in cells and "นามสกุล" in cells:
+                    hdr = cells
+                    start = rows.index(row) + 1
+                    break
+            if hdr is None:
+                continue
+
+            def ci(name):
+                return hdr.index(name) if name in hdr else None
+            c_thf, c_thl = ci("ชื่อ"), ci("นามสกุล")
+            c_enf, c_enl = ci("ชื่อ (EN)"), ci("นามสกุล (EN)")
+            for row in rows[start:]:
+                def g(idx):
+                    if idx is None or idx >= len(row) or row[idx] is None:
+                        return ""
+                    return str(row[idx]).strip()
+                th = re.sub(r"\s+", " ", (g(c_thf) + " " + g(c_thl))).strip()
+                en = re.sub(r"\s+", " ", (g(c_enf) + " " + g(c_enl))).strip()
+                if len(th) >= 2:
+                    out.append(th)
+                if len(en) >= 3:
+                    out.append(en)
+        return out
 
     def _clear_names(self):
         if QMessageBox.question(self, "ยืนยัน", "ล้างรายชื่อทั้งหมด?",
@@ -7775,7 +7823,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.3.2"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8042,6 +8090,17 @@ CHANGELOG = [
             "แก้ปัญหารูปที่มีข้อความเยอะ (amount/transfer/เลขธุรกรรม) ทำให้จับผิด/ไม่เจอ",
             "ตอนนี้ใช้ 'เฉพาะเลข ai#EXP' เป็นกุญแจจับคู่ ตัดข้อความอื่นทิ้ง",
             "ทนต่อ OCR อ่านเพี้ยนมากขึ้น (ช่องว่างแทรก / O↔0 / I↔1)",
+        ],
+    },
+    {
+        "version": "2.3.2",
+        "date": "01/07/2569",
+        "title": "ข้อมูลลับ: Import รายชื่อจากไฟล์ Excel (.xlsx) ได้",
+        "items": [
+            "หน้าจัดการข้อมูลลับ Import ไฟล์ Excel (.xlsx) ได้แล้ว (นอกจาก .csv/.txt)",
+            "อ่านคอลัมน์ 'ชื่อ'/'นามสกุล' (ไทย+อังกฤษ) จากหัวตารางอัตโนมัติ",
+            "รองรับไฟล์รายชื่อพนักงานจากระบบ HR — อัปเดตรายชื่อใหม่แล้ว import ทับได้เลย",
+            "ข้ามชื่อเล่น (สั้น/โหล เสี่ยงซ่อนยอดผิดคน) — ใช้ชื่อเต็มเท่านั้น",
         ],
     },
 ]
