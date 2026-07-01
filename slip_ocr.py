@@ -55,8 +55,16 @@ def ocr_image_text(path: str) -> str:
 
 
 # แท็กเลขเอกสาร: ai#EXP0215444 / #EXP038977 / EXP2026060148 ฯลฯ
-_EXP_RE = re.compile(r"(?:ai\s*#?\s*)?#?\s*(EXP\s*[0-9]{3,})", re.IGNORECASE)
+# รองรับ OCR อ่านเพี้ยน: ช่องว่างแทรกในเลข + ตัวอักษรที่มักสับสนกับตัวเลข (O/o→0 ฯลฯ)
 _AMT_RE = re.compile(r"([0-9][0-9,]*\.[0-9]{2})")
+
+
+def _norm_exp_digits(s: str) -> str:
+    """แปลงตัวอักษรที่ OCR มักอ่านสับสนให้เป็นตัวเลข (เฉพาะส่วนเลขหลัง EXP)"""
+    table = {"O": "0", "o": "0", "D": "0", "Q": "0",
+             "I": "1", "l": "1", "|": "1",
+             "S": "5", "s": "5", "B": "8", "Z": "2", "z": "2"}
+    return "".join(table.get(ch, ch) for ch in s)
 # วันที่แบบ '29 Jun 26' หรือ '29 Jun 2026'
 _DATE_RE = re.compile(r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2,4})")
 _MONTHS = {m: i for i, m in enumerate(
@@ -65,11 +73,14 @@ _MONTHS = {m: i for i, m in enumerate(
 
 
 def _extract_exp(text: str) -> str:
-    """ดึงเลขเอกสาร EXP จากข้อความ OCR (รวมช่องว่างที่ OCR แทรกออก)"""
-    m = _EXP_RE.search(text or "")
+    """ดึงเลขเอกสาร EXP จากข้อความ OCR — เอาช่องว่างออก + แก้ตัวอักษรที่อ่านเพี้ยน
+    'ai#EXP 021 5444' / 'EXPO215444' → 'EXP0215444'"""
+    # เอาช่องว่างในตัวเลขออกก่อน (OCR ชอบแทรก) แล้วค้น EXP ตามด้วยเลข/ตัวอักษรที่ปนได้
+    t = re.sub(r"\s+", "", text or "")
+    m = re.search(r"EXP([0-9OoDQIl\|SsBZz]{3,})", t, re.IGNORECASE)
     if not m:
         return ""
-    return re.sub(r"\s+", "", m.group(1)).upper()   # 'EXP 0215444' → 'EXP0215444'
+    return "EXP" + _norm_exp_digits(m.group(1))
 
 
 def _extract_amount(text: str) -> float:
@@ -122,12 +133,13 @@ def parse_slip_image(path: str) -> dict:
         "recv_name": recv_name,
         "amount": amount,
         "pay_date": pay_date,
-        # ใส่เลข EXP ให้เด่น + ข้อความ OCR ทั้งหมด (ตัวจับคู่ค้นเลขอ้างอิงในนี้)
-        "detail": (f"ai#{exp} " if exp else "") + (text or ""),
+        # *** ใช้เฉพาะเลข EXP เป็นกุญแจจับคู่ *** — ไม่ใส่ข้อความ OCR ทั้งก้อน
+        # (ยอด/transfer/เลขธุรกรรม ฯลฯ จะไปกวนตัวจับคู่ ทำให้จับผิด/ไม่เจอ)
+        "detail": (f"ai#{exp}" if exp else ""),
         "ref": "",
         "recv_acct": "",
         "_img_path": path,
         "_ocr_exp": exp,
-        "_ocr_text": text,
+        "_ocr_text": text,      # เก็บข้อความเต็มไว้ดู/ดีบั๊ก (ไม่ใช้จับคู่)
         "_source": "image",
     }
