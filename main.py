@@ -7728,7 +7728,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.1.2"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -7942,6 +7942,16 @@ CHANGELOG = [
         "items": [
             "เวอร์ชันทดสอบ — ยืนยันว่าระบบบังคับอัปเดตอัตโนมัติจาก GitHub ทำงานครบวงจร",
             "เก็บข้อมูลผู้ใช้/รหัสผ่าน/ตั้งค่าไว้ครบตอนอัปเดต",
+        ],
+    },
+    {
+        "version": "2.1.2",
+        "date": "01/07/2569",
+        "title": "แก้ตัวติดตั้งอัปเดต (robocopy เขียนทับไฟล์ไม่สำเร็จ)",
+        "items": [
+            "แก้บั๊กที่ทำให้อัปเดตแล้วไฟล์ไม่ถูกเขียนทับจริง (ยังเป็นเวอร์ชันเดิม)",
+            "สคริปต์อัปเดตเปิดหน้าต่างจริง + รอโปรแกรมปิดสนิทก่อนก๊อปไฟล์ + เขียน log ไว้ตรวจสอบ",
+            "ตั้งแต่เวอร์ชันนี้ อัปเดตอัตโนมัติเขียนทับไฟล์ได้สำเร็จจริง",
         ],
     },
 ]
@@ -8457,36 +8467,47 @@ class MainWindow(QMainWindow):
                 "queue_plan.json rejected.json paid_pending.json activity_log.json "
                 "queue_log.json share_links.json")
         bat = os.path.join(tempfile.gettempdir(), "kcash_update.bat")
+        log = os.path.join(tempfile.gettempdir(), "kcash_update_log.txt")
+        exe_full = os.path.join(app_dir, exe_name)
+        # ใช้ ping แทน timeout (timeout ต้องมี console/stdin ไม่งั้น error)
+        # เปิดใน console จริง (CREATE_NEW_CONSOLE) เพื่อให้ robocopy/ping ทำงานปกติ
         bat_src = (
             "@echo off\r\n"
             "chcp 65001 >nul\r\n"
-            "echo Updating KCash Queue System...\r\n"
+            "title KCash Update - do not close\r\n"
+            f'echo === KCash update start %date% %time% === > "{log}"\r\n'
+            "echo Updating KCash Queue System... please wait (do not close this window)\r\n"
             ":waitloop\r\n"
             f'tasklist /FI "IMAGENAME eq {exe_name}" 2>nul | find /I "{exe_name}" >nul\r\n'
             "if not errorlevel 1 (\r\n"
-            "  timeout /t 1 /nobreak >nul\r\n"
+            "  ping -n 2 127.0.0.1 >nul\r\n"
             "  goto waitloop\r\n"
             ")\r\n"
-            f'robocopy "{new_dir}" "{app_dir}" /E /R:3 /W:2 /XF {keep} >nul\r\n'
-            f'start "" "{os.path.join(app_dir, exe_name)}"\r\n'
+            "ping -n 3 127.0.0.1 >nul\r\n"          # เผื่อ handle ไฟล์ยังไม่ปลดล็อกทันที
+            f'echo copying %date% %time% >> "{log}"\r\n'
+            f'robocopy "{new_dir}" "{app_dir}" /E /R:5 /W:1 /XF {keep} >> "{log}" 2>&1\r\n'
+            f'echo robocopy exit=%errorlevel% >> "{log}"\r\n'
+            f'start "" "{exe_full}"\r\n'
+            f'echo relaunched %date% %time% >> "{log}"\r\n'
             f'rmdir /S /Q "{stage}" >nul 2>&1\r\n'
             'del "%~f0" >nul 2>&1\r\n'
         )
         try:
+            # เขียน bat เป็น ANSI/mbcs — cmd อ่าน path ที่มีอักขระไทย/พิเศษได้ถูก
+            with open(bat, "w", encoding="mbcs", errors="replace") as f:
+                f.write(bat_src)
+        except Exception:
             with open(bat, "w", encoding="utf-8") as f:
                 f.write(bat_src)
-        except Exception as exc:
-            QMessageBox.warning(self, "อัปเดตไม่สำเร็จ", f"เขียนสคริปต์ไม่สำเร็จ:\n{exc}")
-            return
 
         QMessageBox.information(self, "พร้อมอัปเดต",
             "โปรแกรมจะปิดตัวเองและอัปเดต จากนั้นจะเปิดขึ้นมาใหม่อัตโนมัติ\n"
             "(ใช้เวลาสักครู่ — กรุณาอย่าปิดหน้าต่างดำที่เด้งขึ้นมา)")
         try:
-            subprocess.Popen(["cmd", "/c", bat],
-                             creationflags=0x00000008 | 0x00000200)  # DETACHED | NEW_GROUP
+            # CREATE_NEW_CONSOLE = 0x10 → มีหน้าต่าง console จริง ให้คำสั่งทำงานครบ
+            subprocess.Popen(["cmd", "/c", bat], creationflags=0x00000010)
         except Exception:
-            subprocess.Popen(["cmd", "/c", bat])
+            os.startfile(bat)   # fallback สุดท้าย
         # ปิดโปรแกรมเพื่อให้สคริปต์ก๊อปทับได้
         QApplication.quit()
         os._exit(0)
