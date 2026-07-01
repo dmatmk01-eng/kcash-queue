@@ -2592,6 +2592,9 @@ class QueueTab(QWidget):
             "QCalendarWidget QAbstractItemView{color:#0f172a;background:white;"
             "selection-background-color:#16a34a;selection-color:white;}"
         )
+        # เริ่มต้น: ยังไม่กรองวันที่ — โชว์ข้อมูลทั้งหมด (ล่าสุด→เก่าสุด)
+        # จะกรองก็ต่อเมื่อผู้ใช้เลือกวันที่/กด "เดือนนี้" เอง
+        self._date_active = False
         for de in (self.date_from, self.date_to):
             de.setCalendarPopup(True)
             de.setLocale(QLocale(QLocale.Language.English))   # เลขอารบิก + ค.ศ. (ไม่ใช่เลขไทย)
@@ -2599,9 +2602,15 @@ class QueueTab(QWidget):
             de.setFixedWidth(110)
             de.calendarWidget().setStyleSheet(cal_style)
             de.calendarWidget().setLocale(QLocale(QLocale.Language.English))  # ปี ค.ศ. ในปฏิทินด้วย
-            de.dateChanged.connect(self._apply_filter)
+            de.dateChanged.connect(self._on_date_changed)
         self.btn_today = QPushButton("📅 เดือนนี้")
-        self.btn_today.setToolTip("กลับมาช่วงเดือนปัจจุบัน → วันนี้")
+        self.btn_today.setToolTip("กรองเฉพาะช่วงเดือนปัจจุบัน → วันนี้")
+        self.btn_all_dates = QPushButton("🗓️ ทุกวันที่")
+        self.btn_all_dates.setToolTip("ยกเลิกกรองวันที่ — โชว์ข้อมูลทั้งหมด (ล่าสุด→เก่าสุด)")
+        self.btn_all_dates.setStyleSheet(
+            "QPushButton{padding:4px 10px;border:1px solid #cbd5e1;border-radius:4px;"
+            "background:white;color:#475569;font-size:12px;}QPushButton:hover{background:#f1f5f9;}")
+        self.btn_all_dates.clicked.connect(self._clear_date_filter)
         self.btn_today.setStyleSheet(
             "QPushButton{padding:4px 10px;border:1px solid #16a34a;border-radius:4px;"
             "background:white;color:#15803d;font-size:12px;}QPushButton:hover{background:#e7f5ed;}")
@@ -2631,6 +2640,7 @@ class QueueTab(QWidget):
         top_row.addWidget(QLabel("ถึง"))
         top_row.addWidget(self.date_to)
         top_row.addWidget(self.btn_today)
+        top_row.addWidget(self.btn_all_dates)
         top_row.addStretch()
         top_row.addWidget(self.btn_monday)
         top_row.addWidget(self.btn_refresh_cache)
@@ -3312,8 +3322,18 @@ class QueueTab(QWidget):
             if m.get("id") not in existing_ids:
                 self._expenses.append(m)
 
+    def _on_date_changed(self, *_):
+        """ผู้ใช้เลือกวันที่เอง → เปิดโหมดกรองวันที่ แล้วกรองทันที"""
+        self._date_active = True
+        self._apply_filter()
+
+    def _clear_date_filter(self):
+        """ยกเลิกกรองวันที่ — กลับไปโชว์ข้อมูลทั้งหมด (ล่าสุด→เก่าสุด)"""
+        self._date_active = False
+        self._apply_filter()
+
     def _reset_dates_today(self):
-        """กลับมาช่วงเดือนปัจจุบัน → วันนี้"""
+        """กรองเฉพาะช่วงเดือนปัจจุบัน → วันนี้"""
         t = QDate.currentDate()
         self.date_from.blockSignals(True)
         self.date_to.blockSignals(True)
@@ -3321,6 +3341,7 @@ class QueueTab(QWidget):
         self.date_to.setDate(t)
         self.date_from.blockSignals(False)
         self.date_to.blockSignals(False)
+        self._date_active = True   # กด "เดือนนี้" = เริ่มกรองวันที่
         self._apply_filter()
 
     def _status_category(self, e):
@@ -3346,13 +3367,16 @@ class QueueTab(QWidget):
 
         filtered = list(self._current_docs())
 
-        # ── ตัวกรองวันที่ (ข้อ 6) — กรองทันทีตามช่วงวันที่เอกสาร (publishedOn) ──
-        d_from = self.date_from.date().toString("yyyy-MM-dd")
-        d_to   = self.date_to.date().toString("yyyy-MM-dd")
         def _docdate(e):
             return (e.get("publishedOn") or e.get("createdDate")
                     or _due(e) or "")[:10]
-        filtered = [e for e in filtered if d_from <= _docdate(e) <= d_to]
+
+        # ── ตัวกรองวันที่ (ข้อ 6) — กรองเฉพาะเมื่อผู้ใช้เลือกวันที่/กด "เดือนนี้" ──
+        # ค่าเริ่มต้น: ไม่กรอง → โชว์ข้อมูลทั้งหมด (เรียงล่าสุด→เก่าสุด)
+        if getattr(self, "_date_active", False):
+            d_from = self.date_from.date().toString("yyyy-MM-dd")
+            d_to   = self.date_to.date().toString("yyyy-MM-dd")
+            filtered = [e for e in filtered if d_from <= _docdate(e) <= d_to]
 
         # ── ฟิลเตอร์สถานะ/กำหนดจ่าย (รวมเป็นอันเดียว) ──
         sc = self.status_filter.currentIndex() if hasattr(self, "status_filter") else 0
@@ -7704,7 +7728,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "1.8"
+APP_VERSION = "1.9"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -7888,6 +7912,17 @@ CHANGELOG = [
             "ข้อมูลลับ: จับคู่ชื่อยืดหยุ่นขึ้น (ไม่ติดคำนำหน้า/ช่องว่าง) + กดบันทึกแล้วซ่อนทันที",
             "เพิ่มปุ่ม 'รีเซ็ตรหัสผ่าน' ในหน้าจัดการข้อมูลลับ",
             "รายชื่อข้อมูลลับแสดงบรรทัดเดียว ไม่ตัดบรรทัด",
+        ],
+    },
+    {
+        "version": "1.9",
+        "date": "01/07/2569",
+        "title": "เปิดมาโชว์ข้อมูลทั้งหมดก่อน (ไม่กรองวันที่อัตโนมัติ)",
+        "items": [
+            "เปิดโปรแกรม/ดึงข้อมูล → โชว์รายการทั้งหมดทันที เรียงล่าสุด→เก่าสุด (ไม่กรองวันที่)",
+            "ตัวกรองวันที่จะทำงานเมื่อผู้ใช้เลือกวันเอง หรือกดปุ่ม 'เดือนนี้' เท่านั้น",
+            "เพิ่มปุ่ม '🗓️ ทุกวันที่' — ยกเลิกกรองวันที่ กลับไปดูทั้งหมด",
+            "แก้ปัญหาต้นเดือนแล้วตารางว่าง (เพราะเดิมกรองเป็นวันนี้วันเดียวอัตโนมัติ)",
         ],
     },
 ]
