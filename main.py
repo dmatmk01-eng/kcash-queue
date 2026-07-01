@@ -7728,7 +7728,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "1.9"
+APP_VERSION = "2.0"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -7759,7 +7759,8 @@ class UpdateCheckWorker(QThread):
         import json as _json
         try:
             repo = _update_repo()
-            if not repo or repo == UPDATE_REPO_DEFAULT:
+            # ข้ามเฉพาะตอนยังไม่ได้ตั้ง repo (placeholder) — ไม่ใช่ repo จริง
+            if not repo or repo.strip().lower() in ("", "owner/repo"):
                 self.none.emit(); return
             url = f"https://api.github.com/repos/{repo}/releases/latest"
             headers = {"User-Agent": "KCash-Updater", "Accept": "application/vnd.github+json"}
@@ -7923,6 +7924,15 @@ CHANGELOG = [
             "ตัวกรองวันที่จะทำงานเมื่อผู้ใช้เลือกวันเอง หรือกดปุ่ม 'เดือนนี้' เท่านั้น",
             "เพิ่มปุ่ม '🗓️ ทุกวันที่' — ยกเลิกกรองวันที่ กลับไปดูทั้งหมด",
             "แก้ปัญหาต้นเดือนแล้วตารางว่าง (เพราะเดิมกรองเป็นวันนี้วันเดียวอัตโนมัติ)",
+        ],
+    },
+    {
+        "version": "2.0",
+        "date": "01/07/2569",
+        "title": "แก้ระบบอัปเดตอัตโนมัติให้ทำงานจริง",
+        "items": [
+            "แก้บั๊กที่ทำให้โปรแกรมไม่เคยเช็คอัปเดตจริง (เด้งว่า 'ล่าสุดแล้ว' ตลอด)",
+            "ตั้งแต่เวอร์ชันนี้เป็นต้นไป จะเช็ค + บังคับอัปเดตอัตโนมัติจาก GitHub ได้จริง",
         ],
     },
 ]
