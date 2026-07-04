@@ -373,6 +373,23 @@ def _exp_item_amounts(e: dict) -> list:
 # อัตราหัก ณ ที่จ่ายที่พบบ่อย (จ่ายจริง = ยอดเอกสาร − x%)
 _WHT_RATES = (0.01, 0.02, 0.03, 0.05)
 
+# ตัวอักษรที่บัญชีมัก 'พิมพ์ผิด' แทนตัวเลขในเลข EXP (เช่น EXPO38917 = EXP038917)
+_EXP_DIGIT = {"o": "0", "d": "0", "q": "0", "i": "1", "l": "1", "|": "1",
+              "s": "5", "b": "8", "z": "2", "g": "9"}
+
+
+def _slip_exp_tag(slip) -> str:
+    """ดึงเลขเอกสาร EXP ที่บัญชีพิมพ์ในรายละเอียดสลิป + แก้ตัวอักษรที่พิมพ์เพี้ยน
+    ให้เป็นตัวเลข (EXPO38917 → EXP038917) เพื่อจับกับเลขเอกสารจริงใน FlowAccount.
+    คืน '' ถ้าไม่พบ/แปลงแล้วไม่ใช่เลขล้วน"""
+    text = str(slip.get("detail", "") or "") + " " + str(slip.get("ref", "") or "")
+    t = re.sub(r"\s+", "", text).lower()
+    m = re.search(r"exp([0-9odqil\|sbzg]{3,})", t)
+    if not m:
+        return ""
+    tail = "".join(_EXP_DIGIT.get(ch, ch) for ch in m.group(1))
+    return ("EXP" + tail) if tail.isdigit() else ""
+
 
 def _ref_tokens_from_detail(slip) -> list:
     """ดึง 'เลขบิล/เลขอ้างอิง/ทะเบียนรถ' ที่บัญชีพิมพ์ในช่อง 'รายละเอียดของรายการ'
@@ -522,6 +539,19 @@ def match_slip_to_expenses(slip_records: list, expenses: list,
             results.append({"slip": s, "expense": expenses[exact_i],
                             "score": 1.0, "status": "matched"})
             continue
+
+        # 0.55) เลข EXP ที่บัญชีพิมพ์ในรายละเอียด แต่ 'พิมพ์เพี้ยน' (EXPO38917=EXP038917)
+        #       → แก้ตัวอักษรเป็นเลขแล้วจับกับเลขเอกสารจริงตรง ๆ (กุญแจเฉพาะ = เขียว)
+        s_exp = _slip_exp_tag(s)
+        if s_exp:
+            hit_i = by_ref.get(s_exp.lower())
+            if hit_i is not None and hit_i not in used:
+                used.add(hit_i)
+                _learn_green(s, expenses[hit_i])
+                results.append({"slip": s, "expense": expenses[hit_i],
+                                "score": 1.0, "status": "matched", "via": "reference",
+                                "match_note": f"ตรงเลขเอกสาร: {s_exp}"})
+                continue
 
         # 0.6) ค้น "เลขบิล/เลขอ้างอิง" ที่พิมพ์ในรายละเอียดสลิป → ในข้อความเอกสารทั้งใบ
         #      (รวมเลขที่อ้างอิง/หมายเหตุ/บรรทัดย่อย) — แม่นมาก เพราะเป็นเลขเฉพาะ
