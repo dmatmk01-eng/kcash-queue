@@ -5333,7 +5333,8 @@ class SlipAttachWorker(QThread):
 
     def run(self):
         from bank_slip import crop_all_rows
-        from flowaccount import upload_expense_attachment, mark_expense_paid
+        from flowaccount import (upload_expense_attachment, mark_expense_paid,
+                                 update_expense_dates)
         recs = [r["slip"] for r in self.items]
         try:
             pngs = crop_all_rows(self.pdf_path, recs)
@@ -5371,8 +5372,19 @@ class SlipAttachWorker(QThread):
             except Exception as ex:
                 attach_err = str(ex)[:120]
 
-            # 2) เปลี่ยนสถานะเป็นจ่ายแล้วใน FlowAccount
-            pay_date = s.get("pay_date") or today_str()
+            # 2) แก้วันที่เอกสาร + ครบกำหนด = วันที่แนบ (วันนี้) + เครดิต 0
+            #    (ทำก่อน mark จ่าย — ให้วันเอกสารตรงกับวันแนบตามที่ลูกค้าต้องการ)
+            attach_date = today_str()
+            datefix_err = ""
+            try:
+                update_expense_dates(cid, csec, eid, attach_date)
+                e["publishedOn"] = attach_date
+                e["dueDate"] = attach_date
+            except Exception as ex:
+                datefix_err = str(ex)[:150]
+
+            # 3) เปลี่ยนสถานะเป็นจ่ายแล้วใน FlowAccount (วันจ่าย = วันที่โอนจริงจากสลิป)
+            pay_date = s.get("pay_date") or attach_date
             try:
                 mark_expense_paid(cid, csec, eid, {
                     "paymentDate": pay_date,
@@ -5386,9 +5398,10 @@ class SlipAttachWorker(QThread):
             except Exception as ex:
                 status_err = str(ex)[:120]
 
-            if attach_err or status_err:
+            if attach_err or status_err or datefix_err:
                 fail += 1
-                problems.append({"doc": doc, "attach": attach_err, "status": status_err})
+                problems.append({"doc": doc, "attach": attach_err,
+                                 "status": status_err or datefix_err})
             else:
                 ok += 1
             self.progress.emit(i, len(self.items))
@@ -7823,7 +7836,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "3.5"
+APP_VERSION = "3.5.1"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8123,6 +8136,17 @@ CHANGELOG = [
             "ตัดบิลจากรูปภาพได้ (อ่านแท็ก ai#EXP ด้วย OCR)",
             "ซ่อนยอดเงิน (Sensitive) + Import รายชื่อพนักงานจาก Excel",
             "ปรับขนาดคอลัมน์อิสระ + เปิดมาโชว์ข้อมูลทั้งหมดก่อน",
+        ],
+    },
+    {
+        "version": "3.5.1",
+        "date": "04/07/2569",
+        "title": "ตัดบิล+แนบ: ตั้งวันที่เอกสาร = วันที่แนบ + เครดิต 0",
+        "items": [
+            "ตอน 'ตัดบิล + แนบเข้า FlowAccount' → ตั้งวันที่เอกสารและวันครบกำหนด = วันที่แนบ (วันนี้)",
+            "ตั้งเครดิต (วัน) = 0",
+            "คงยอด/รายการ/VAT เดิมไว้ครบ — เปลี่ยนแค่วันที่/เครดิต",
+            "ถ้าแก้วันที่ไม่สำเร็จ → แจ้งเตือน (ไม่กระทบการแนบ/บันทึกจ่าย)",
         ],
     },
 ]
