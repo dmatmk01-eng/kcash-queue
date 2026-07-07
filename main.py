@@ -7008,8 +7008,13 @@ class LoginDialog(QDialog):
         right = QFrame()
         right.setStyleSheet("background:white;")
         rl = QVBoxLayout(right)
-        rl.setContentsMargins(46, 46, 46, 46)
+        rl.setContentsMargins(46, 16, 46, 46)
         rl.setSpacing(14)
+        # เลขเวอร์ชัน มุมขวาบน (สีแดง)
+        ver_lbl = QLabel(f"v{APP_VERSION}")
+        ver_lbl.setStyleSheet(
+            "color:#dc2626;font-size:13px;font-weight:700;background:transparent;")
+        rl.addWidget(ver_lbl, alignment=Qt.AlignmentFlag.AlignRight)
         title = QLabel("เข้าสู่ระบบ")
         title.setStyleSheet("font-size:24px;font-weight:700;color:#0f172a;background:transparent;")
         rl.addWidget(title)
@@ -7823,7 +7828,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "3.6"
+APP_VERSION = "3.6.1"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8132,6 +8137,14 @@ CHANGELOG = [
         "items": [
             "รวมทุกฟีเจอร์/การแก้ไขล่าสุด พร้อมใช้งานจริง",
             "อัปเดตอัตโนมัติ + จับคู่สลิปแม่น (EXP/บิล/PO) + ตัดบิลจากรูป (OCR) + ซ่อนยอดเงิน",
+        ],
+    },
+    {
+        "version": "3.6.1",
+        "date": "04/07/2569",
+        "title": "แสดงเลขเวอร์ชันที่หน้า Login",
+        "items": [
+            "เพิ่มเลขเวอร์ชัน (สีแดง) มุมขวาบนหน้าเข้าสู่ระบบ — ดูได้ว่าเครื่องนี้เวอร์ชันอะไร",
         ],
     },
 ]
