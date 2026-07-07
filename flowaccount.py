@@ -331,26 +331,18 @@ def update_expense_dates(api_key: str, secret_key: str, expense_id,
     if not detail:
         raise FlowAccountError("ดึงเอกสารเดิมไม่ได้ (ว่าง)")
 
-    # คัดเฉพาะ field ที่ PUT ยอมรับ (คงค่าเดิมทุกอย่าง — ยอด/VAT/รายการ)
-    body = {k: detail[k] for k in _EXPENSE_DOC_FIELDS
-            if k in detail and detail[k] is not None}
+    # ส่งเอกสารกลับทั้งใบ (round-trip GET→PUT บน resource เดียวกัน = คงทุกอย่างครบ)
+    # แล้วเปลี่ยนเฉพาะ 3 ช่อง: วันที่เอกสาร / ครบกำหนด / เครดิตวัน
+    body = dict(detail)
+    body["publishedOn"] = new_date        # 'yyyy-MM-dd' (รูปแบบที่ v1 ExpenseDocument รับ)
+    body["dueDate"] = new_date            # ครบกำหนด = วันเดียวกับวันที่เอกสาร
+    body["creditDays"] = 0                # เครดิต 0 วัน
 
-    # วันที่แบบ ISO พร้อมโซนไทย (ให้ตรงรูปแบบที่ API คาดหวัง)
-    iso = f"{new_date}T00:00:00.000+07:00"
-    body["publishedOn"] = iso
-    body["dueDate"] = iso            # ครบกำหนด = วันเดียวกับวันที่เอกสาร
-    body["creditDays"] = 0           # เครดิต 0 วัน
-    if "recordId" not in body:
-        try:
-            body["recordId"] = int(expense_id)
-        except (TypeError, ValueError):
-            pass
-
-    # *** v1 API ไม่มี endpoint แก้เอกสาร — ต้องใช้ v3 (FlowAccount ระบุเป็น prod server) ***
+    # endpoint แก้เอกสาร = PUT /expenses/{id} (path เดียวกับ GET) — v1 ก่อน, แล้วค่อย v3
     last_err = ""
     for url in (
-        f"{V3_BASE}/{culture}/expenses/simple-document/{expense_id}",
-        f"{V3_BASE}/{culture}/expenses/inline-document/{expense_id}",
+        f"{BASE_URL}/expenses/{expense_id}",
+        f"{V3_BASE}/{culture}/expenses/{expense_id}",
     ):
         try:
             resp = requests.put(url, headers=_headers_json(api_key, secret_key),
@@ -363,7 +355,7 @@ def update_expense_dates(api_key: str, secret_key: str, expense_id,
                 return resp.json()
             except Exception:
                 return {}
-        if resp.status_code == 404:        # เอกสารคนละชนิด (simple/inline) → ลองอีกแบบ
+        if resp.status_code == 404:        # path ไม่ตรงเวอร์ชัน → ลองตัวถัดไป
             last_err = f"404 {url}"
             continue
         # 4xx/5xx อื่น = schema/สิทธิ์/auth ฯลฯ → หยุด แล้วรายงาน (ข้อความช่วย debug)
