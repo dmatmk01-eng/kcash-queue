@@ -338,12 +338,11 @@ def update_expense_dates(api_key: str, secret_key: str, expense_id,
     body["dueDate"] = new_date            # ครบกำหนด = วันเดียวกับวันที่เอกสาร
     body["creditDays"] = 0                # เครดิต 0 วัน
 
-    # endpoint แก้เอกสาร = PUT /expenses/{id} (path เดียวกับ GET) — v1 ก่อน, แล้วค่อย v3
+    url = f"{BASE_URL}/expenses/{expense_id}"   # PUT /expenses/{id} = แก้เอกสาร (path เดียวกับ GET)
     last_err = ""
-    for url in (
-        f"{BASE_URL}/expenses/{expense_id}",
-        f"{V3_BASE}/{culture}/expenses/{expense_id}",
-    ):
+    # v1 ต้องระบุ expenseStructureType — ลองแบบ Simple ก่อน (ทั่วไป) แล้วค่อย Inline
+    for structure in ("UpdateExpenseSimpleDocument", "UpdateExpenseInlineDocument"):
+        body["expenseStructureType"] = structure
         try:
             resp = requests.put(url, headers=_headers_json(api_key, secret_key),
                                 json=body, timeout=25)
@@ -355,13 +354,13 @@ def update_expense_dates(api_key: str, secret_key: str, expense_id,
                 return resp.json()
             except Exception:
                 return {}
-        if resp.status_code == 404:        # path ไม่ตรงเวอร์ชัน → ลองตัวถัดไป
-            last_err = f"404 {url}"
+        # ถ้า error เรื่อง 'ชนิดเอกสาร' → ลองอีกชนิด, error อื่น → รายงานทันที
+        if resp.status_code == 400 and "structuretype" in resp.text.lower():
+            last_err = f"{resp.status_code} {resp.text[:200]}"
             continue
-        # 4xx/5xx อื่น = schema/สิทธิ์/auth ฯลฯ → หยุด แล้วรายงาน (ข้อความช่วย debug)
         raise FlowAccountError(
             f"แก้วันที่เอกสารล้มเหลว: {resp.status_code} {resp.text[:220]}")
-    raise FlowAccountError(f"แก้วันที่เอกสารล้มเหลว: หา endpoint ไม่เจอ ({last_err})")
+    raise FlowAccountError(f"แก้วันที่เอกสารล้มเหลว (ทั้ง simple/inline): {last_err}")
 
 
 # path ขอลิงก์แชร์ตามประเภทเอกสาร
