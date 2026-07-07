@@ -8,8 +8,6 @@ import requests
 from typing import Optional
 
 BASE_URL = "https://openapi.flowaccount.com/v1"
-# v1 อ่าน/สร้าง/ลบ/จ่ายได้ แต่ 'แก้ไขเอกสาร' ไม่มีใน v1 — ต้องใช้ v3 (prod server)
-V3_BASE = "https://openapi.flowaccount.com/v3-alpha"
 TOKEN_URL = "https://openapi.flowaccount.com/v1/token"
 
 _token_cache: dict = {"access_token": None, "expires_at": 0, "client_id": None}
@@ -305,74 +303,7 @@ def get_expense_detail(api_key: str, secret_key: str, expense_id: str) -> dict:
     return resp.json().get("data", {})
 
 
-# field ที่ SimpleDocument (body สำหรับ PUT แก้เอกสาร) ยอมรับ — จาก FlowAccount OpenAPI
-# (additionalProperties:false → ส่ง field นอกนี้ไม่ได้ ต้องคัดเฉพาะนี้)
-_EXPENSE_DOC_FIELDS = (
-    "recordId", "contactCode", "contactName", "contactAddress", "contactTaxId",
-    "contactBranch", "contactPerson", "contactEmail", "contactNumber", "contactZipCode",
-    "contactGroup", "publishedOn", "creditType", "creditDays", "dueDate", "salesName",
-    "projectName", "reference", "isVatInclusive", "useReceiptDeduction", "subTotal",
-    "discountPercentage", "discountAmount", "totalAfterDiscount", "isVat", "vatAmount",
-    "grandTotal", "documentShowWithholdingTax", "documentWithholdingTaxPercentage",
-    "documentWithholdingTaxAmount", "documentDeductionType", "documentDeductionAmount",
-    "remarks", "internalNotes", "showSignatureOrStamp", "documentStructureType",
-    "externalId", "saleAndPurchaseChannel", "rowIndex", "items", "documentReference",
-    "exemptAmount",
-)
 
-
-def update_expense_dates(api_key: str, secret_key: str, expense_id,
-                         new_date: str, culture: str = "th") -> dict:
-    """แก้ 'วันที่เอกสาร + ครบกำหนด' = new_date และ 'เครดิต(วัน) = 0'
-    วิธี: ดึงเอกสารเดิม → เปลี่ยนเฉพาะ 3 ช่องวันที่/เครดิต → ส่งกลับทั้งใบ (คงยอด/รายการเดิม)
-    new_date: 'yyyy-MM-dd'.  *** แก้เอกสารเงินจริง — ทดสอบก่อนใช้จริงเสมอ ***
-    ถ้า schema ไม่ตรง API จะปฏิเสธ (ไม่เขียนข้อมูลมั่ว) → โยน error ให้ผู้เรียกรายงาน"""
-    detail = get_expense_detail(api_key, secret_key, expense_id)
-    if not detail:
-        raise FlowAccountError("ดึงเอกสารเดิมไม่ได้ (ว่าง)")
-
-    # GET /expenses/{id} คืนมาเป็น wrapper {totalDocument, list:[doc]} — แกะเอกสารจริงออก
-    if isinstance(detail.get("list"), list) and detail["list"]:
-        doc = detail["list"][0]
-    else:
-        doc = detail
-    if not doc.get("items"):
-        raise FlowAccountError("เอกสารไม่มีรายการ (items) — แก้วันที่ไม่ได้")
-
-    # ส่งเอกสารกลับทั้งใบ (round-trip = คงทุกอย่าง: รายการ/ยอด/ผังบัญชี/VAT)
-    # ตัด field อ่านอย่างเดียวที่ PUT ไม่รับ (payments/company เป็น object ซ้อน)
-    body = dict(doc)
-    for _ro in ("payments", "company"):
-        body.pop(_ro, None)
-    # เปลี่ยนเฉพาะ 3 ช่อง: วันที่เอกสาร / ครบกำหนด / เครดิตวัน (format ตรงกับที่ API คืนมา)
-    d_iso = f"{new_date}T00:00:00"
-    body["publishedOn"] = d_iso
-    body["dueDate"] = d_iso               # ครบกำหนด = วันเดียวกับวันที่เอกสาร
-    body["creditDays"] = 0                # เครดิต 0 วัน
-
-    url = f"{BASE_URL}/expenses/{expense_id}"   # PUT /expenses/{id} = แก้เอกสาร (path เดียวกับ GET)
-    last_err = ""
-    # v1 ต้องระบุ expenseStructureType — ลองแบบ Simple ก่อน (ทั่วไป) แล้วค่อย Inline
-    for structure in ("UpdateExpenseSimpleDocument", "UpdateExpenseInlineDocument"):
-        body["expenseStructureType"] = structure
-        try:
-            resp = requests.put(url, headers=_headers_json(api_key, secret_key),
-                                json=body, timeout=25)
-        except requests.RequestException as ex:
-            last_err = str(ex)
-            continue
-        if resp.ok:
-            try:
-                return resp.json()
-            except Exception:
-                return {}
-        # ถ้า error เรื่อง 'ชนิดเอกสาร' → ลองอีกชนิด, error อื่น → รายงานทันที
-        if resp.status_code == 400 and "structuretype" in resp.text.lower():
-            last_err = f"{resp.status_code} {resp.text[:200]}"
-            continue
-        raise FlowAccountError(
-            f"แก้วันที่เอกสารล้มเหลว: {resp.status_code} {resp.text[:220]}")
-    raise FlowAccountError(f"แก้วันที่เอกสารล้มเหลว (ทั้ง simple/inline): {last_err}")
 
 
 # path ขอลิงก์แชร์ตามประเภทเอกสาร
