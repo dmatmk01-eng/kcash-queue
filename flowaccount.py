@@ -331,11 +331,23 @@ def update_expense_dates(api_key: str, secret_key: str, expense_id,
     if not detail:
         raise FlowAccountError("ดึงเอกสารเดิมไม่ได้ (ว่าง)")
 
-    # ส่งเอกสารกลับทั้งใบ (round-trip GET→PUT บน resource เดียวกัน = คงทุกอย่างครบ)
-    # แล้วเปลี่ยนเฉพาะ 3 ช่อง: วันที่เอกสาร / ครบกำหนด / เครดิตวัน
-    body = dict(detail)
-    body["publishedOn"] = new_date        # 'yyyy-MM-dd' (รูปแบบที่ v1 ExpenseDocument รับ)
-    body["dueDate"] = new_date            # ครบกำหนด = วันเดียวกับวันที่เอกสาร
+    # GET /expenses/{id} คืนมาเป็น wrapper {totalDocument, list:[doc]} — แกะเอกสารจริงออก
+    if isinstance(detail.get("list"), list) and detail["list"]:
+        doc = detail["list"][0]
+    else:
+        doc = detail
+    if not doc.get("items"):
+        raise FlowAccountError("เอกสารไม่มีรายการ (items) — แก้วันที่ไม่ได้")
+
+    # ส่งเอกสารกลับทั้งใบ (round-trip = คงทุกอย่าง: รายการ/ยอด/ผังบัญชี/VAT)
+    # ตัด field อ่านอย่างเดียวที่ PUT ไม่รับ (payments/company เป็น object ซ้อน)
+    body = dict(doc)
+    for _ro in ("payments", "company"):
+        body.pop(_ro, None)
+    # เปลี่ยนเฉพาะ 3 ช่อง: วันที่เอกสาร / ครบกำหนด / เครดิตวัน (format ตรงกับที่ API คืนมา)
+    d_iso = f"{new_date}T00:00:00"
+    body["publishedOn"] = d_iso
+    body["dueDate"] = d_iso               # ครบกำหนด = วันเดียวกับวันที่เอกสาร
     body["creditDays"] = 0                # เครดิต 0 วัน
 
     url = f"{BASE_URL}/expenses/{expense_id}"   # PUT /expenses/{id} = แก้เอกสาร (path เดียวกับ GET)
