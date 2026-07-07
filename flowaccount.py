@@ -8,6 +8,8 @@ import requests
 from typing import Optional
 
 BASE_URL = "https://openapi.flowaccount.com/v1"
+# v1 อ่าน/สร้าง/ลบ/จ่ายได้ แต่ 'แก้ไขเอกสาร' ไม่มีใน v1 — ต้องใช้ v3 (prod server)
+V3_BASE = "https://openapi.flowaccount.com/v3-alpha"
 TOKEN_URL = "https://openapi.flowaccount.com/v1/token"
 
 _token_cache: dict = {"access_token": None, "expires_at": 0, "client_id": None}
@@ -344,12 +346,11 @@ def update_expense_dates(api_key: str, secret_key: str, expense_id,
         except (TypeError, ValueError):
             pass
 
+    # *** v1 API ไม่มี endpoint แก้เอกสาร — ต้องใช้ v3 (FlowAccount ระบุเป็น prod server) ***
     last_err = ""
-    # ลอง endpoint ตามลำดับ (v1 base + culture ก่อน, แล้วค่อยแบบไม่มี culture)
     for url in (
-        f"{BASE_URL}/{culture}/expenses/simple-document/{expense_id}",
-        f"{BASE_URL}/expenses/simple-document/{expense_id}",
-        f"{BASE_URL}/{culture}/expenses/inline-document/{expense_id}",
+        f"{V3_BASE}/{culture}/expenses/simple-document/{expense_id}",
+        f"{V3_BASE}/{culture}/expenses/inline-document/{expense_id}",
     ):
         try:
             resp = requests.put(url, headers=_headers_json(api_key, secret_key),
@@ -362,11 +363,12 @@ def update_expense_dates(api_key: str, secret_key: str, expense_id,
                 return resp.json()
             except Exception:
                 return {}
-        if resp.status_code == 404:        # endpoint ไม่ตรงเวอร์ชัน → ลองตัวถัดไป
+        if resp.status_code == 404:        # เอกสารคนละชนิด (simple/inline) → ลองอีกแบบ
             last_err = f"404 {url}"
             continue
-        # 4xx/5xx อื่น = schema/สิทธิ์ ฯลฯ → หยุด แล้วรายงาน (ข้อความช่วย debug)
-        raise FlowAccountError(f"แก้วันที่เอกสารล้มเหลว: {resp.status_code} {resp.text[:200]}")
+        # 4xx/5xx อื่น = schema/สิทธิ์/auth ฯลฯ → หยุด แล้วรายงาน (ข้อความช่วย debug)
+        raise FlowAccountError(
+            f"แก้วันที่เอกสารล้มเหลว: {resp.status_code} {resp.text[:220]}")
     raise FlowAccountError(f"แก้วันที่เอกสารล้มเหลว: หา endpoint ไม่เจอ ({last_err})")
 
 
