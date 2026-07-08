@@ -3675,8 +3675,10 @@ class QueueTab(QWidget):
         self._update_buttons()
 
     def _auto_queue(self):
-        """จัดคิวอัตโนมัติ — กระจายเป็นหลายวัน (ค่าเริ่มต้น 3 วัน) แล้วเลือกทั้งหมด"""
-        from PyQt6.QtWidgets import QInputDialog
+        """จัดคิวอัตโนมัติ — กระจายเป็นหลายวัน (ค่าเริ่มต้น 3 วัน) แล้วเลือกทั้งหมด
+        เพิ่ม: เลือกเดือนจากปฏิทินได้ → จัดเฉพาะบิลของเดือนนั้น (ไม่เลือก = จัดทั้งหมดแบบเดิม)"""
+        from PyQt6.QtWidgets import (QInputDialog, QDialog, QVBoxLayout,
+                                     QHBoxLayout, QCalendarWidget)
         if not self._expenses:
             QMessageBox.information(self, "ยังไม่มีข้อมูล",
                 "กรุณากด 🔄 รีเฟรช เพื่อดึงข้อมูลก่อนครับ")
@@ -3689,6 +3691,60 @@ class QueueTab(QWidget):
             QMessageBox.information(self, "ไม่มีรายการ", "ไม่มีรายการรอจ่าย")
             return
 
+        # ── เลือกเดือนที่จะจัดคิว (ปฏิทิน) — ไม่เลือก = จัดทั้งหมดตามเดิม ──
+        pdlg = QDialog(self)
+        pdlg.setWindowTitle("🤖 จัดคิวอัตโนมัติ — เลือกเดือน")
+        pv = QVBoxLayout(pdlg)
+        _hint = QLabel("เลือก 'วัน' ในเดือนที่ต้องการจัดคิว แล้วกด «จัดของเดือนที่เลือก»\n"
+                       "หรือกด «จัดทั้งหมด» เพื่อจัดตามปกติ (ทุกบิลรอจ่าย)")
+        _hint.setStyleSheet("font-size:12px;color:#334155;")
+        pv.addWidget(_hint)
+        cal = QCalendarWidget()
+        cal.setSelectedDate(QDate.currentDate())
+        cal.setLocale(QLocale(QLocale.Language.English))   # ปี ค.ศ. + เลขอารบิก
+        pv.addWidget(cal)
+        prow = QHBoxLayout()
+        b_month = QPushButton("📅 จัดของเดือนที่เลือก")
+        b_month.setStyleSheet("QPushButton{background:#16a34a;color:white;border:none;"
+                              "border-radius:5px;padding:6px 14px;font-weight:600;}"
+                              "QPushButton:hover{background:#15803d;}")
+        b_all = QPushButton("จัดทั้งหมด (แบบเดิม)")
+        b_all.setStyleSheet("QPushButton{background:#2563eb;color:white;border:none;"
+                            "border-radius:5px;padding:6px 14px;font-weight:600;}"
+                            "QPushButton:hover{background:#1d4ed8;}")
+        b_cancel = QPushButton("ยกเลิก")
+        b_cancel.setStyleSheet("QPushButton{background:#f1f5f9;border:1px solid #cbd5e1;"
+                               "border-radius:5px;padding:6px 14px;color:#334155;}")
+        prow.addWidget(b_month); prow.addWidget(b_all)
+        prow.addStretch(); prow.addWidget(b_cancel)
+        pv.addLayout(prow)
+        choice = {"mode": None}
+        b_month.clicked.connect(lambda: (choice.update(mode="month"), pdlg.accept()))
+        b_all.clicked.connect(lambda: (choice.update(mode="all"), pdlg.accept()))
+        b_cancel.clicked.connect(pdlg.reject)
+        pdlg.exec()
+        if not choice["mode"]:
+            return
+
+        month_label = ""
+        if choice["mode"] == "month":
+            sel = cal.selectedDate()
+            ym = (sel.year(), sel.month())
+
+            def _in_sel_month(e):
+                d = (e.get("publishedOn") or e.get("createdDate") or _due(e) or "")[:10]
+                try:
+                    dt = date.fromisoformat(d)
+                    return (dt.year, dt.month) == ym
+                except Exception:
+                    return False
+            candidates = [e for e in candidates if _in_sel_month(e)]
+            if not candidates:
+                QMessageBox.information(self, "ไม่มีรายการ",
+                    f"ไม่มีบิลรอจ่ายในเดือน {sel.month():02d}/{sel.year()}")
+                return
+            month_label = f"  (เฉพาะเดือน {sel.month():02d}/{sel.year()})"
+
         # กดจัดคิวใหม่ → ดีดการจัดเรียงเดิมทิ้ง (ข้อ 10)
         queue_plan.clear_plan()
 
@@ -3698,7 +3754,7 @@ class QueueTab(QWidget):
 
         n, ok = QInputDialog.getInt(
             self, "🤖 จัดคิวอัตโนมัติ",
-            f"มีรายการรอจ่ายจัดได้ทั้งหมด {maxd} วัน\nต้องการจัดคิวกี่วัน?",
+            f"มีรายการรอจ่ายจัดได้ทั้งหมด {maxd} วัน{month_label}\nต้องการจัดคิวกี่วัน?",
             min(3, maxd), 1, maxd)
         if not ok:
             return
@@ -7828,7 +7884,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "3.6.1"
+APP_VERSION = "3.7"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8145,6 +8201,16 @@ CHANGELOG = [
         "title": "แสดงเลขเวอร์ชันที่หน้า Login",
         "items": [
             "เพิ่มเลขเวอร์ชัน (สีแดง) มุมขวาบนหน้าเข้าสู่ระบบ — ดูได้ว่าเครื่องนี้เวอร์ชันอะไร",
+        ],
+    },
+    {
+        "version": "3.7",
+        "date": "04/07/2569",
+        "title": "จัดคิวอัตโนมัติ: เลือกเดือนได้",
+        "items": [
+            "กด 'จัดคิวอัตโนมัติ' → มีปฏิทินให้เลือกเดือน",
+            "เลือกวันในเดือน แล้วกด «จัดของเดือนที่เลือก» → จัดเฉพาะบิลของเดือนนั้น",
+            "กด «จัดทั้งหมด» → จัดทุกบิลรอจ่ายตามปกติ (แบบเดิม)",
         ],
     },
 ]
