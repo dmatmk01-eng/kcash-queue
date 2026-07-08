@@ -707,6 +707,19 @@ class SettingsDialog(QDialog):
         self.accept()
 
 
+_CAL_STYLE = (
+    "QCalendarWidget QWidget#qt_calendar_navigationbar{background:#16a34a;}"
+    "QCalendarWidget QToolButton{color:white;font-size:13px;font-weight:bold;"
+    "background:transparent;border:none;padding:4px 10px;}"
+    "QCalendarWidget QToolButton:hover{background:#15803d;border-radius:4px;}"
+    "QCalendarWidget QToolButton::menu-indicator{image:none;}"
+    "QCalendarWidget QSpinBox{color:#0f172a;background:white;}"
+    "QCalendarWidget QMenu{color:#0f172a;background:white;}"
+    "QCalendarWidget QAbstractItemView{color:#0f172a;background:white;"
+    "selection-background-color:#16a34a;selection-color:white;}"
+)
+
+
 class QueuePlanDialog(QDialog):
     """
     ตารางคิวจ่ายหลายวัน
@@ -829,6 +842,12 @@ class QueuePlanDialog(QDialog):
         tb3.addSpacing(8)
         tb3.addWidget(self.lbl_manual)
         tb3.addStretch()
+        # ป้ายบอกช่วงวันที่ของบิลในคิว (รายการของเดือน/ช่วงไหน)
+        self.lbl_period = QLabel("")
+        self.lbl_period.setStyleSheet(
+            "color:#2563eb;font-size:12px;font-weight:700;"
+            "background:#eff6ff;border:1px solid #bfdbfe;border-radius:4px;padding:3px 10px;")
+        tb3.addWidget(self.lbl_period)
         lay.addLayout(tb3)
 
         # ── แถบค้นหาในคิว (ค้นชื่อ/เลขเอกสาร แบบบางส่วน ไฮไลต์ให้เห็น) ──
@@ -1098,6 +1117,18 @@ class QueuePlanDialog(QDialog):
         # อัปเดตช่วงวันที่ของช่องจัดคิวเอง (เผื่อจำนวนวันเปลี่ยน) +1 เพื่อสร้างวันใหม่ได้
         if hasattr(self, "spin_day"):
             self.spin_day.setMaximum(max(1, len(self._days) + 1))
+        # ป้ายช่วงวันที่ของบิลในคิว (บอกว่าเป็นรายการของช่วง/เดือนไหน)
+        if hasattr(self, "lbl_period"):
+            dd = [(e.get("publishedOn") or e.get("createdDate") or _due(e) or "")[:10]
+                  for grp in self._days for e in grp]
+            dd = [x for x in dd if x]
+            if dd:
+                lo, hi = min(dd), max(dd)
+                self.lbl_period.setText(
+                    f"📆 บิลของช่วง {fmt_date(lo)} – {fmt_date(hi)}" if lo != hi
+                    else f"📆 บิลวันที่ {fmt_date(lo)}")
+            else:
+                self.lbl_period.setText("")
 
     # ── ตัวช่วยหา selection ──
     def _selected_node(self):
@@ -1274,13 +1305,14 @@ class QueuePlanDialog(QDialog):
         dlg.setWindowTitle("📅 เลือกวันจ่าย")
         v = QVBoxLayout(dlg)
         v.setContentsMargins(16, 14, 16, 14); v.setSpacing(10)
-        v.addWidget(QLabel(f"เลือกวันจ่ายสำหรับ «วันที่ {di + 1}»\n"
-                           "(เลื่อนไปวันหลังได้ตามต้องการ)"))
+        v.addWidget(QLabel(f"เลือกวันจ่ายของ «วันที่ {di + 1}»\n"
+                           "เลือกวันไหนก็ได้ — วันหัวกลุ่มจะเปลี่ยนเป็นวันนั้น"))
         de = QDateEdit(QDate(cur.year, cur.month, cur.day))
         de.setCalendarPopup(True)
         de.setDisplayFormat("dd/MM/yyyy")
         de.setLocale(QLocale(QLocale.Language.English))
         de.calendarWidget().setLocale(QLocale(QLocale.Language.English))
+        de.calendarWidget().setStyleSheet(_CAL_STYLE)   # ให้เดือน/ปีเห็นชัด
         v.addWidget(de)
         row = QHBoxLayout()
         b_ok = QPushButton("✅ ใช้วันนี้")
@@ -1554,6 +1586,21 @@ class QueueHistoryDialog(QDialog):
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._reload)
         bar.addWidget(self.search, 1)
+        # ปุ่ม Export (เลือกแถวประวัติแล้วกด) — ดูย้อนหลัง/ส่งต่อได้
+        self.btn_h_excel = QPushButton("⬇️ Excel/PDF")
+        self.btn_h_excel.setStyleSheet(
+            "QPushButton{padding:5px 12px;border:none;border-radius:4px;"
+            "background:#16a34a;color:white;font-weight:600;}"
+            "QPushButton:hover{background:#15803d;}")
+        self.btn_h_excel.clicked.connect(self._export_history_files)
+        bar.addWidget(self.btn_h_excel)
+        self.btn_h_link = QPushButton("🔗 ลิงก์")
+        self.btn_h_link.setStyleSheet(
+            "QPushButton{padding:5px 12px;border:none;border-radius:4px;"
+            "background:#2563eb;color:white;font-weight:600;}"
+            "QPushButton:hover{background:#1d4ed8;}")
+        self.btn_h_link.clicked.connect(self._export_history_link)
+        bar.addWidget(self.btn_h_link)
         self.btn_del = QPushButton("🗑️ ลบที่เลือก")
         self.btn_del.setStyleSheet(
             "QPushButton{padding:5px 12px;border:none;border-radius:4px;"
@@ -1639,6 +1686,107 @@ class QueueHistoryDialog(QDialog):
         dl.addWidget(QLabel(f"รวม {len(items)} รายการ • {fmt_amount(total)} บาท"))
         btn = QPushButton("ปิด"); btn.clicked.connect(dlg.accept)
         dl.addWidget(btn)
+        dlg.exec()
+
+    def _selected_history(self):
+        row = self.table.currentRow()
+        if not (0 <= row < len(self._rows)):
+            QMessageBox.information(self, "ยังไม่ได้เลือก",
+                "คลิกเลือกแถวประวัติที่ต้องการก่อนครับ")
+            return None
+        return self._rows[row]
+
+    def _history_to_days(self, r):
+        """แปลงรายการในประวัติ → รูปแบบ days ([{date, items}]) ที่ตัว Export ใช้"""
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for it in (r.get("items") or []):
+            groups[int(it.get("day", 1) or 1)].append(it)
+        days = []
+        for dno in sorted(groups):
+            its = groups[dno]
+            try:
+                dt = date.fromisoformat((its[0].get("date") or "")[:10])
+            except Exception:
+                dt = date.today()
+            exps = [{
+                "contactName": it.get("vendor", ""),
+                "grandTotal": float(it.get("amount", 0) or 0),
+                "documentSerial": it.get("doc", ""),
+                "_brand_name": it.get("brand", ""),
+                "dueDate": "",
+            } for it in its]
+            days.append({"date": dt, "items": exps})
+        return days
+
+    def _export_history_files(self):
+        r = self._selected_history()
+        if not r:
+            return
+        days = self._history_to_days(r)
+        if not days:
+            QMessageBox.information(self, "ไม่มีรายการ", "ประวัตินี้ไม่มีรายการ")
+            return
+        ts = str(r.get("time", "")).replace("T", " ")[:19].replace(":", "").replace(" ", "_")
+        base, _ = QFileDialog.getSaveFileName(
+            self, "บันทึกไฟล์ (ได้ทั้ง Excel และ PDF)",
+            f"KCash_Queue_{ts}", "ไฟล์ (*.xlsx)")
+        if not base:
+            return
+        for ext in (".xlsx", ".pdf", ".csv"):
+            if base.lower().endswith(ext):
+                base = base[:-len(ext)]
+        cfg = load_config()
+        try:
+            build_bank_excel_multiday(days, cfg, base + ".xlsx")
+            build_bank_pdf_multiday(days, cfg, base + ".pdf")
+        except Exception as e:
+            QMessageBox.critical(self, "❌ ผิดพลาด", f"บันทึกไฟล์ไม่สำเร็จ:\n{e}")
+            return
+        QMessageBox.information(self, "✅ สำเร็จ",
+            f"บันทึกประวัติคิวแล้ว:\n\n📊 {base}.xlsx\n📄 {base}.pdf")
+
+    def _export_history_link(self):
+        r = self._selected_history()
+        if not r:
+            return
+        days = self._history_to_days(r)
+        if not days:
+            QMessageBox.information(self, "ไม่มีรายการ", "ประวัตินี้ไม่มีรายการ")
+            return
+        cfg = load_config()
+        gh_token = cfg.get("github_token", "").strip()
+        permanent = bool(gh_token)
+        expiry_txt = ("ลิงก์ถาวร (ไม่หมดอายุ)" if permanent
+                      else "ลิงก์สุ่ม หมดอายุอัตโนมัติใน 72 ชั่วโมง")
+        if QMessageBox.question(self, "สร้างลิงก์ (ลิงก์สาธารณะ)",
+                f"สร้างลิงก์เปิดดูประวัติคิวนี้บนอินเทอร์เน็ต\n\n"
+                f"• {expiry_txt}\n"
+                "• ใครมีลิงก์ก็เปิดดูได้ (มีชื่อผู้รับ/ยอดเงิน)\n\nยืนยัน?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+                ) != QMessageBox.StandardButton.Yes:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            html = build_bank_html_multiday(days, cfg)
+            url = (upload_html_github(html, gh_token) if permanent
+                   else upload_html_temp(html, "72h"))
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "❌ อัปโหลดไม่สำเร็จ",
+                f"สร้างลิงก์ไม่สำเร็จ (เช็คเน็ต/Token):\n{e}")
+            return
+        QApplication.restoreOverrideCursor()
+        QApplication.clipboard().setText(url)
+        QDesktopServices.openUrl(QUrl(url))
+        note = ("• ลิงก์ถาวร ไม่หมดอายุ" if permanent
+                else "• หมดอายุอัตโนมัติใน 72 ชม.")
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("✅ สร้างลิงก์แล้ว")
+        dlg.setTextFormat(Qt.TextFormat.RichText)
+        dlg.setText(f"คัดลอกลิงก์ให้แล้ว + เปิดในเบราว์เซอร์<br><br>"
+                    f"<a href='{url}'>{url}</a><br><br>"
+                    f"<span style='color:#64748b'>{note}</span>")
         dlg.exec()
 
     def _delete_selected(self):
@@ -3773,6 +3921,7 @@ class QueueTab(QWidget):
             de.setDisplayFormat("dd/MM/yyyy")
             de.setLocale(QLocale(QLocale.Language.English))
             de.calendarWidget().setLocale(QLocale(QLocale.Language.English))
+            de.calendarWidget().setStyleSheet(_CAL_STYLE)   # ให้เดือน/ปีเห็นชัด
             de.setFixedWidth(120)
         drow.addWidget(de_from)
         drow.addWidget(QLabel("ถึง"))
@@ -7959,7 +8108,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "3.7.1"
+APP_VERSION = "3.8"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8296,6 +8445,17 @@ CHANGELOG = [
             "จัดคิวอัตโนมัติเปลี่ยนเป็นเลือก 'ช่วงวันที่' (from-to) แบบกล่องวันที่ อ่านง่ายขึ้น",
             "ตารางคิวจ่าย (หลายวัน): ดับเบิลคลิกที่หัววัน → เลือกวันจ่ายเองได้ (เลื่อนไปวันหลัง)",
             "วันจ่ายที่กำหนดเองถูกบันทึกเมื่อกด 'บันทึกคิว' หรือปิดหน้าต่าง",
+        ],
+    },
+    {
+        "version": "3.8",
+        "date": "08/07/2569",
+        "title": "ปรับปฏิทิน/เปลี่ยนวันจ่าย + Export ประวัติการจัดคิว",
+        "items": [
+            "ปฏิทินเลือกวันที่โชว์เดือน/ปีชัดขึ้น (แถบเขียว)",
+            "ดับเบิลคลิกหัววันในตารางคิว = เลือกวันจ่ายของวันนั้นได้ (เปลี่ยนวันที่ ไม่ใช่เลื่อน)",
+            "ตารางคิวจ่ายโชว์ป้าย 'ช่วงวันที่ของบิล' — รู้ว่าเป็นรายการของเดือน/ช่วงไหน",
+            "หน้าประวัติการจัดคิว: Export เป็น Excel/PDF และสร้างลิงก์ดูย้อนหลังได้",
         ],
     },
 ]
