@@ -1610,16 +1610,21 @@ class QueueHistoryDialog(QDialog):
         bar.addWidget(self.btn_del)
         lay.addLayout(bar)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["เวลาบันทึก", "รายละเอียด", "จำนวนรายการ", "ยอดรวม (บาท)"])
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(0, 150)
-        self.table.setColumnWidth(2, 110)
-        self.table.setColumnWidth(3, 140)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["☐", "เวลาบันทึก", "รายละเอียด", "จำนวนรายการ", "ยอดรวม (บาท)"])
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(0, 40)     # ช่องติ๊กเลือก
+        self.table.setColumnWidth(1, 150)
+        self.table.setColumnWidth(3, 110)
+        self.table.setColumnWidth(4, 140)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.cellDoubleClicked.connect(self._show_detail)
+        self._all_checked = False
+        # กดหัวคอลัมน์ช่องติ๊ก (คอลัมน์แรก) = เลือกทั้งหมด / กดอีกที = ปลดทั้งหมด
+        self.table.horizontalHeader().sectionClicked.connect(self._on_header_click)
         lay.addWidget(self.table, 1)
 
         self.lbl_sum = QLabel("")
@@ -1642,18 +1647,50 @@ class QueueHistoryDialog(QDialog):
             total = sum(float(it.get("amount", 0) or 0) for it in (r.get("items") or []))
             row = self.table.rowCount()
             self.table.insertRow(row)
+            # คอลัมน์ 0 = ช่องติ๊กเลือก
+            chk = QTableWidgetItem()
+            chk.setFlags((chk.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                         & ~Qt.ItemFlag.ItemIsEditable)
+            chk.setCheckState(Qt.CheckState.Unchecked)
+            chk.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, 0, chk)
             vals = [str(r.get("time", "")).replace("T", " ")[:19],
                     r.get("detail", ""),
                     str(r.get("count", len(r.get("items") or []))),
                     fmt_amount(total)]
-            for c, v in enumerate(vals):
+            for c, v in enumerate(vals, start=1):   # ขยับไปคอลัมน์ 1 เป็นต้นไป
                 item = QTableWidgetItem(v)
-                if c in (2, 3):
+                if c in (3, 4):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(row, c, item)
+        self._all_checked = False
+        self.table.horizontalHeaderItem(0).setText("☐")
         self.lbl_sum.setText(f"ทั้งหมด {len(rows)} ครั้งที่บันทึกคิว")
 
+    def _on_header_click(self, col):
+        """กดหัวคอลัมน์แรก = ติ๊กเลือกทั้งหมด / กดอีกที = ปลดทั้งหมด"""
+        if col != 0:
+            return
+        self._all_checked = not self._all_checked
+        state = Qt.CheckState.Checked if self._all_checked else Qt.CheckState.Unchecked
+        for row in range(self.table.rowCount()):
+            it = self.table.item(row, 0)
+            if it is not None:
+                it.setCheckState(state)
+        self.table.horizontalHeaderItem(0).setText("☑" if self._all_checked else "☐")
+
+    def _checked_rows(self):
+        """คืน index แถวที่ติ๊กไว้"""
+        out = []
+        for row in range(self.table.rowCount()):
+            it = self.table.item(row, 0)
+            if it is not None and it.checkState() == Qt.CheckState.Checked:
+                out.append(row)
+        return out
+
     def _show_detail(self, row, col):
+        if col == 0:            # คอลัมน์ติ๊กเลือก → ไม่เปิดรายละเอียด
+            return
         if not (0 <= row < len(self._rows)):
             return
         r = self._rows[row]
@@ -1689,10 +1726,12 @@ class QueueHistoryDialog(QDialog):
         dlg.exec()
 
     def _selected_history(self):
-        row = self.table.currentRow()
+        # ใช้แถวที่ติ๊ก (ถ้าติ๊กหลายอันจะใช้อันแรก) ไม่งั้นใช้แถวที่คลิกเลือก
+        checked = self._checked_rows()
+        row = checked[0] if checked else self.table.currentRow()
         if not (0 <= row < len(self._rows)):
             QMessageBox.information(self, "ยังไม่ได้เลือก",
-                "คลิกเลือกแถวประวัติที่ต้องการก่อนครับ")
+                "ติ๊ก ☑ หรือคลิกเลือกแถวประวัติที่ต้องการก่อนครับ")
             return None
         return self._rows[row]
 
@@ -1790,17 +1829,24 @@ class QueueHistoryDialog(QDialog):
         dlg.exec()
 
     def _delete_selected(self):
-        row = self.table.currentRow()
-        if not (0 <= row < len(self._rows)):
-            QMessageBox.information(self, "ยังไม่ได้เลือก", "คลิกเลือกแถวที่จะลบก่อนครับ")
+        # ลบทุกแถวที่ติ๊กไว้ (ถ้าไม่ได้ติ๊ก → ใช้แถวที่คลิกเลือกอยู่)
+        rows = self._checked_rows()
+        if not rows:
+            cur = self.table.currentRow()
+            if 0 <= cur < len(self._rows):
+                rows = [cur]
+        if not rows:
+            QMessageBox.information(self, "ยังไม่ได้เลือก",
+                "ติ๊ก ☑ หน้ารายการที่จะลบก่อน (หรือคลิกเลือกแถว)")
             return
-        r = self._rows[row]
+        targets = [self._rows[r] for r in rows if 0 <= r < len(self._rows)]
         if QMessageBox.question(self, "ลบประวัติ",
-                f"ลบประวัติการจัดคิวของ {str(r.get('time','')).replace('T',' ')[:19]} ?",
+                f"ลบประวัติการจัดคิว {len(targets)} รายการที่เลือก?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
                 ) != QMessageBox.StandardButton.Yes:
             return
-        activity_log.delete_queue_log(r.get("time", ""))
+        for r in targets:
+            activity_log.delete_queue_log(r.get("time", ""))
         self._reload()
 
 
@@ -8119,7 +8165,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "3.8.1"
+APP_VERSION = "3.9"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8476,6 +8522,16 @@ CHANGELOG = [
         "items": [
             "Export (Excel/PDF/ลิงก์) ใช้วันจ่ายตามที่จัดคิว+บันทึกไว้ (รวมวันที่กำหนดเอง) ตรงกับตารางคิว",
             "แก้เลขลำดับ 2 หลักขึ้นไปตกบรรทัดใน PDF — ให้อยู่บรรทัดเดียว",
+        ],
+    },
+    {
+        "version": "3.9",
+        "date": "08/07/2569",
+        "title": "ประวัติการจัดคิว: ติ๊กเลือกหลายรายการ",
+        "items": [
+            "เพิ่มช่องติ๊กเลือกหน้าแต่ละรายการในหน้าประวัติการจัดคิว",
+            "กดหัวคอลัมน์ (☐) = เลือกทั้งหมด, กดอีกที = ปลดทั้งหมด",
+            "ปุ่ม 'ลบที่เลือก' ลบได้หลายรายการที่ติ๊กพร้อมกัน",
         ],
     },
 ]
