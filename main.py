@@ -730,6 +730,7 @@ class QueuePlanDialog(QDialog):
         self._selected_items = []   # ผลลัพธ์เมื่อกด "เลือกวันนี้ไปจ่าย"
         self._marked_pending = []   # exp ที่กด Mark จ่ายแล้วรออัพเดต
         self._saved_at = ""
+        self._day_dates_override = {}   # {index วัน: 'yyyy-mm-dd'} วันจ่ายที่ผู้ใช้กำหนดเอง
 
         # โหลดการจัดเรียงที่บันทึกไว้ (ถ้ามี) ไม่งั้นกระจายอัตโนมัติ
         self._days = self._load_or_distribute(candidates)
@@ -739,7 +740,7 @@ class QueuePlanDialog(QDialog):
         head = QLabel(
             f"กระจายรายการที่ยังไม่จ่ายลงแต่ละวัน — วงเงิน "
             f"{('฿{:,.0f}/วัน'.format(self._limit)) if self._limit > 0 else 'ไม่จำกัด'}\n"
-            "เลือกรายการแล้วกดปุ่มลูกศรเพื่อย้ายไปวันอื่น • ดับเบิลคลิกหัววันเพื่อเลือกทั้งวันไปจ่าย")
+            "เลือกรายการแล้วกดปุ่มลูกศรเพื่อย้ายไปวันอื่น • ดับเบิลคลิกที่หัววัน (วันที่) เพื่อเปลี่ยนวันจ่าย")
         head.setStyleSheet("color:#15803d;font-size:13px;font-weight:600;padding:2px 0;")
         lay.addWidget(head)
 
@@ -939,6 +940,10 @@ class QueuePlanDialog(QDialog):
             days.extend(self._distribute(leftover))
         days = [g for g in days if g] or [[]]
         self._saved_at = saved.get("saved_at", "")
+        # โหลดวันจ่ายที่ผู้ใช้กำหนดเอง (ถ้าเคยบันทึกไว้)
+        saved_dates = saved.get("dates") or []
+        self._day_dates_override = {
+            i: iso for i, iso in enumerate(saved_dates) if iso}
         return days
 
     # ── การกระจายรายการ ──
@@ -983,7 +988,8 @@ class QueuePlanDialog(QDialog):
         return _nbd(d)
 
     def _day_dates(self):
-        """คืน list ของวันที่ (date) ตามจำนวนวันใน self._days (ข้ามวันหยุด)"""
+        """คืน list ของวันที่ (date) ตามจำนวนวันใน self._days (ข้ามวันหยุด)
+        ถ้าผู้ใช้กำหนดวันจ่ายเอง (ดับเบิลคลิกหัววัน) จะใช้วันนั้นแทนของวันนั้น ๆ"""
         from utils import _is_day_off
         dates = []
         d = date.today()
@@ -992,6 +998,13 @@ class QueuePlanDialog(QDialog):
         for _ in self._days:
             dates.append(d)
             d = self._next_business_day(d)
+        # แทนที่ด้วยวันจ่ายที่ผู้ใช้กำหนดเอง (ถ้ามี)
+        for di, iso in (self._day_dates_override or {}).items():
+            if 0 <= di < len(dates) and iso:
+                try:
+                    dates[di] = date.fromisoformat(iso)
+                except Exception:
+                    pass
         return dates
 
     # ── render ──
@@ -1238,6 +1251,9 @@ class QueuePlanDialog(QDialog):
 
     def _on_double_click(self, item, _col):
         data = item.data(0, Qt.ItemDataRole.UserRole)
+        if data and data[0] == "day":     # ดับเบิลคลิกหัววัน → เปลี่ยนวันจ่าย
+            self._edit_day_date(data[1])
+            return
         if not (data and data[0] == "exp"):
             return
         if _col == 5:        # ช่องหมายเหตุ → แก้ไข
@@ -1247,6 +1263,49 @@ class QueuePlanDialog(QDialog):
         new = (Qt.CheckState.Unchecked if item.checkState(0) == Qt.CheckState.Checked
                else Qt.CheckState.Checked)
         item.setCheckState(0, new)
+
+    def _edit_day_date(self, di):
+        """เลือกวันจ่ายของ 'วันที่ di+1' เอง (เผื่อจะเลื่อนไปจ่ายวันหลัง)
+        — บันทึกเมื่อกด 'บันทึกคิว' หรือตอนปิดหน้าต่าง"""
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QDateEdit)
+        dates = self._day_dates()
+        cur = dates[di] if 0 <= di < len(dates) else date.today()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("📅 เลือกวันจ่าย")
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(16, 14, 16, 14); v.setSpacing(10)
+        v.addWidget(QLabel(f"เลือกวันจ่ายสำหรับ «วันที่ {di + 1}»\n"
+                           "(เลื่อนไปวันหลังได้ตามต้องการ)"))
+        de = QDateEdit(QDate(cur.year, cur.month, cur.day))
+        de.setCalendarPopup(True)
+        de.setDisplayFormat("dd/MM/yyyy")
+        de.setLocale(QLocale(QLocale.Language.English))
+        de.calendarWidget().setLocale(QLocale(QLocale.Language.English))
+        v.addWidget(de)
+        row = QHBoxLayout()
+        b_ok = QPushButton("✅ ใช้วันนี้")
+        b_ok.setStyleSheet("QPushButton{background:#16a34a;color:white;border:none;"
+                           "border-radius:5px;padding:6px 14px;font-weight:600;}")
+        b_reset = QPushButton("↺ ใช้วันอัตโนมัติ")
+        b_reset.setStyleSheet("QPushButton{background:#f1f5f9;border:1px solid #cbd5e1;"
+                              "border-radius:5px;padding:6px 12px;color:#334155;}")
+        b_cancel = QPushButton("ยกเลิก")
+        b_cancel.setStyleSheet("QPushButton{background:#f1f5f9;border:1px solid #cbd5e1;"
+                               "border-radius:5px;padding:6px 12px;color:#334155;}")
+        row.addWidget(b_ok); row.addWidget(b_reset); row.addStretch(); row.addWidget(b_cancel)
+        v.addLayout(row)
+        res = {"act": None}
+        b_ok.clicked.connect(lambda: (res.update(act="set"), dlg.accept()))
+        b_reset.clicked.connect(lambda: (res.update(act="reset"), dlg.accept()))
+        b_cancel.clicked.connect(dlg.reject)
+        dlg.exec()
+        if res["act"] == "set":
+            self._day_dates_override[di] = de.date().toString("yyyy-MM-dd")
+        elif res["act"] == "reset":
+            self._day_dates_override.pop(di, None)
+        else:
+            return
+        self._render()
 
     def _on_tree_clicked(self, item, col):
         """คลิกคอลัมน์เลขเอกสาร (1) → คัดลอกรหัส EXP/PO (ข้อ 4)"""
@@ -1396,7 +1455,8 @@ class QueuePlanDialog(QDialog):
         n_days = len([g for g in self._days if g])
         now_iso = datetime.now().isoformat(timespec="seconds")
         days_ids = [[_exp_id(e) for e in grp] for grp in self._days]
-        queue_plan.save_plan(days_ids, now_iso)
+        queue_plan.save_plan(days_ids, now_iso,
+                             dates=[d.isoformat() for d in dates])
         self._saved_at = now_iso
         activity_log.log_queue(
             f"บันทึกคิว {n_days} วัน {len(items)} รายการ", items=items)
@@ -1465,6 +1525,7 @@ class QueuePlanDialog(QDialog):
         queue_plan.clear_plan()
         allitems = [e for grp in self._days for e in grp]
         self._days = self._distribute(allitems)
+        self._day_dates_override = {}   # จัดใหม่ → ล้างวันจ่ายที่กำหนดเอง
         self._saved_at = ""
         self.lbl_saved.setText("")
         self._render()
@@ -3678,7 +3739,7 @@ class QueueTab(QWidget):
         """จัดคิวอัตโนมัติ — กระจายเป็นหลายวัน (ค่าเริ่มต้น 3 วัน) แล้วเลือกทั้งหมด
         เพิ่ม: เลือกเดือนจากปฏิทินได้ → จัดเฉพาะบิลของเดือนนั้น (ไม่เลือก = จัดทั้งหมดแบบเดิม)"""
         from PyQt6.QtWidgets import (QInputDialog, QDialog, QVBoxLayout,
-                                     QHBoxLayout, QCalendarWidget)
+                                     QHBoxLayout, QDateEdit)
         if not self._expenses:
             QMessageBox.information(self, "ยังไม่มีข้อมูล",
                 "กรุณากด 🔄 รีเฟรช เพื่อดึงข้อมูลก่อนครับ")
@@ -3691,21 +3752,36 @@ class QueueTab(QWidget):
             QMessageBox.information(self, "ไม่มีรายการ", "ไม่มีรายการรอจ่าย")
             return
 
-        # ── เลือกเดือนที่จะจัดคิว (ปฏิทิน) — ไม่เลือก = จัดทั้งหมดตามเดิม ──
+        # ── เลือกช่วงวันที่จะจัดคิว (กล่องวันที่ from-to) — หรือ 'จัดทั้งหมด' = แบบเดิม ──
         pdlg = QDialog(self)
-        pdlg.setWindowTitle("🤖 จัดคิวอัตโนมัติ — เลือกเดือน")
+        pdlg.setWindowTitle("🤖 จัดคิวอัตโนมัติ")
         pv = QVBoxLayout(pdlg)
-        _hint = QLabel("เลือก 'วัน' ในเดือนที่ต้องการจัดคิว แล้วกด «จัดของเดือนที่เลือก»\n"
-                       "หรือกด «จัดทั้งหมด» เพื่อจัดตามปกติ (ทุกบิลรอจ่าย)")
+        pv.setContentsMargins(18, 16, 18, 16)
+        pv.setSpacing(12)
+        _hint = QLabel("เลือกช่วงวันที่ของบิลที่จะจัดคิว แล้วกด «จัดตามช่วงที่เลือก»\n"
+                       "หรือกด «จัดทั้งหมด» เพื่อจัดทุกบิลรอจ่ายตามปกติ")
         _hint.setStyleSheet("font-size:12px;color:#334155;")
         pv.addWidget(_hint)
-        cal = QCalendarWidget()
-        cal.setSelectedDate(QDate.currentDate())
-        cal.setLocale(QLocale(QLocale.Language.English))   # ปี ค.ศ. + เลขอารบิก
-        pv.addWidget(cal)
+        # กล่องวันที่ from-to (แบบเดียวกับตัวกรองในหน้าคิว) — ค่าเริ่มต้น = ทั้งเดือนปัจจุบัน
+        _t = QDate.currentDate()
+        de_from = QDateEdit(QDate(_t.year(), _t.month(), 1))
+        de_to   = QDateEdit(QDate(_t.year(), _t.month(), _t.daysInMonth()))
+        drow = QHBoxLayout()
+        drow.addWidget(QLabel("📅 วันที่"))
+        for de in (de_from, de_to):
+            de.setCalendarPopup(True)
+            de.setDisplayFormat("dd/MM/yyyy")
+            de.setLocale(QLocale(QLocale.Language.English))
+            de.calendarWidget().setLocale(QLocale(QLocale.Language.English))
+            de.setFixedWidth(120)
+        drow.addWidget(de_from)
+        drow.addWidget(QLabel("ถึง"))
+        drow.addWidget(de_to)
+        drow.addStretch()
+        pv.addLayout(drow)
         prow = QHBoxLayout()
-        b_month = QPushButton("📅 จัดของเดือนที่เลือก")
-        b_month.setStyleSheet("QPushButton{background:#16a34a;color:white;border:none;"
+        b_range = QPushButton("📅 จัดตามช่วงที่เลือก")
+        b_range.setStyleSheet("QPushButton{background:#16a34a;color:white;border:none;"
                               "border-radius:5px;padding:6px 14px;font-weight:600;}"
                               "QPushButton:hover{background:#15803d;}")
         b_all = QPushButton("จัดทั้งหมด (แบบเดิม)")
@@ -3715,11 +3791,11 @@ class QueueTab(QWidget):
         b_cancel = QPushButton("ยกเลิก")
         b_cancel.setStyleSheet("QPushButton{background:#f1f5f9;border:1px solid #cbd5e1;"
                                "border-radius:5px;padding:6px 14px;color:#334155;}")
-        prow.addWidget(b_month); prow.addWidget(b_all)
+        prow.addWidget(b_range); prow.addWidget(b_all)
         prow.addStretch(); prow.addWidget(b_cancel)
         pv.addLayout(prow)
         choice = {"mode": None}
-        b_month.clicked.connect(lambda: (choice.update(mode="month"), pdlg.accept()))
+        b_range.clicked.connect(lambda: (choice.update(mode="range"), pdlg.accept()))
         b_all.clicked.connect(lambda: (choice.update(mode="all"), pdlg.accept()))
         b_cancel.clicked.connect(pdlg.reject)
         pdlg.exec()
@@ -3727,23 +3803,22 @@ class QueueTab(QWidget):
             return
 
         month_label = ""
-        if choice["mode"] == "month":
-            sel = cal.selectedDate()
-            ym = (sel.year(), sel.month())
+        if choice["mode"] == "range":
+            d_from = de_from.date().toString("yyyy-MM-dd")
+            d_to   = de_to.date().toString("yyyy-MM-dd")
+            if d_from > d_to:
+                d_from, d_to = d_to, d_from
 
-            def _in_sel_month(e):
+            def _in_range(e):
                 d = (e.get("publishedOn") or e.get("createdDate") or _due(e) or "")[:10]
-                try:
-                    dt = date.fromisoformat(d)
-                    return (dt.year, dt.month) == ym
-                except Exception:
-                    return False
-            candidates = [e for e in candidates if _in_sel_month(e)]
+                return bool(d) and d_from <= d <= d_to
+            candidates = [e for e in candidates if _in_range(e)]
+            _rng = f"{de_from.date().toString('dd/MM/yyyy')}–{de_to.date().toString('dd/MM/yyyy')}"
             if not candidates:
                 QMessageBox.information(self, "ไม่มีรายการ",
-                    f"ไม่มีบิลรอจ่ายในเดือน {sel.month():02d}/{sel.year()}")
+                    f"ไม่มีบิลรอจ่ายช่วง {_rng}")
                 return
-            month_label = f"  (เฉพาะเดือน {sel.month():02d}/{sel.year()})"
+            month_label = f"  (ช่วง {_rng})"
 
         # กดจัดคิวใหม่ → ดีดการจัดเรียงเดิมทิ้ง (ข้อ 10)
         queue_plan.clear_plan()
@@ -7884,7 +7959,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "3.7"
+APP_VERSION = "3.7.1"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8211,6 +8286,16 @@ CHANGELOG = [
             "กด 'จัดคิวอัตโนมัติ' → มีปฏิทินให้เลือกเดือน",
             "เลือกวันในเดือน แล้วกด «จัดของเดือนที่เลือก» → จัดเฉพาะบิลของเดือนนั้น",
             "กด «จัดทั้งหมด» → จัดทุกบิลรอจ่ายตามปกติ (แบบเดิม)",
+        ],
+    },
+    {
+        "version": "3.7.1",
+        "date": "08/07/2569",
+        "title": "จัดคิว: เลือกช่วงวันแบบกล่องวันที่ + เปลี่ยนวันจ่ายได้",
+        "items": [
+            "จัดคิวอัตโนมัติเปลี่ยนเป็นเลือก 'ช่วงวันที่' (from-to) แบบกล่องวันที่ อ่านง่ายขึ้น",
+            "ตารางคิวจ่าย (หลายวัน): ดับเบิลคลิกที่หัววัน → เลือกวันจ่ายเองได้ (เลื่อนไปวันหลัง)",
+            "วันจ่ายที่กำหนดเองถูกบันทึกเมื่อกด 'บันทึกคิว' หรือปิดหน้าต่าง",
         ],
     },
 ]
