@@ -4489,22 +4489,33 @@ class QueueTab(QWidget):
 
     def _days_saved_or_distribute(self, pool):
         """ถ้ามีการจัดเรียงที่บันทึกในตารางคิว → ใช้อันนั้น (Export ตรงกับตารางคิว)
-        ไม่งั้นกระจายอัตโนมัติตามวงเงิน"""
+        รวม 'วันจ่ายที่ผู้ใช้กำหนดเอง' (dates) ที่บันทึกไว้ด้วย — ไม่งั้นกระจายอัตโนมัติ"""
         saved = queue_plan.load_plan()
         if saved and saved.get("days"):
             by_id = {_exp_id(e): e for e in pool}
-            used, groups = set(), []
-            for day_ids in saved["days"]:
+            saved_dates = saved.get("dates") or []
+            used = set()
+            pairs = []   # (group, วันจ่ายที่บันทึก iso หรือ None) — คงลำดับให้ตรง dates
+            for idx, day_ids in enumerate(saved["days"]):
                 grp = [by_id[i] for i in day_ids if i in by_id and i not in used]
                 for i in day_ids:
                     used.add(i)
-                groups.append(grp)
+                sd = saved_dates[idx] if idx < len(saved_dates) else None
+                pairs.append((grp, sd))
             leftover = [e for e in pool if _exp_id(e) not in used]
             if leftover:
                 for d in distribute_into_days(leftover, self._daily_limit):
-                    groups.append(d["items"])
-            groups = [g for g in groups if g]
-            return assign_dates(groups)
+                    pairs.append((d["items"], None))
+            pairs = [(g, sd) for (g, sd) in pairs if g]   # ตัดวันว่าง (คงคู่ date ไว้)
+            days = assign_dates([g for g, _ in pairs])
+            # ทับด้วยวันจ่ายที่ผู้ใช้กำหนดเองในตารางคิว (ให้ Export ตรงกับที่บันทึก)
+            for k, (_g, sd) in enumerate(pairs):
+                if sd and k < len(days):
+                    try:
+                        days[k]["date"] = date.fromisoformat(str(sd)[:10])
+                    except Exception:
+                        pass
+            return days
         return distribute_into_days(pool, self._daily_limit)
 
     def _ensure_share_links_for_export(self, exps):
@@ -8108,7 +8119,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "3.8"
+APP_VERSION = "3.8.1"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8456,6 +8467,15 @@ CHANGELOG = [
             "ดับเบิลคลิกหัววันในตารางคิว = เลือกวันจ่ายของวันนั้นได้ (เปลี่ยนวันที่ ไม่ใช่เลื่อน)",
             "ตารางคิวจ่ายโชว์ป้าย 'ช่วงวันที่ของบิล' — รู้ว่าเป็นรายการของเดือน/ช่วงไหน",
             "หน้าประวัติการจัดคิว: Export เป็น Excel/PDF และสร้างลิงก์ดูย้อนหลังได้",
+        ],
+    },
+    {
+        "version": "3.8.1",
+        "date": "08/07/2569",
+        "title": "Export ใช้วันจ่ายตามที่บันทึกไว้ + แก้เลขลำดับตกบรรทัด",
+        "items": [
+            "Export (Excel/PDF/ลิงก์) ใช้วันจ่ายตามที่จัดคิว+บันทึกไว้ (รวมวันที่กำหนดเอง) ตรงกับตารางคิว",
+            "แก้เลขลำดับ 2 หลักขึ้นไปตกบรรทัดใน PDF — ให้อยู่บรรทัดเดียว",
         ],
     },
 ]
