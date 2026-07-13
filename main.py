@@ -8165,7 +8165,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "3.9.1"
+APP_VERSION = "3.99"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8535,7 +8535,7 @@ CHANGELOG = [
         ],
     },
     {
-        "version": "3.9.1",
+        "version": "3.99",
         "date": "08/07/2569",
         "title": "ปรับตาราง Export (PDF/Excel/ลิงก์) — แนวนอน + คอลัมน์ใหม่",
         "items": [
