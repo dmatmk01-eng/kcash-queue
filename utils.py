@@ -292,9 +292,15 @@ def build_bank_excel_multiday(days: list, cfg: dict, path: str) -> None:
     from openpyxl.utils import get_column_letter
 
     wb = Workbook(); ws = wb.active; ws.title = "Payment"
-    headers = ["ลำดับ", "ชื่อผู้รับ", "แบรนด์", "เลขบัญชี",
-               "จำนวนเงิน (บาท)", "วันครบกำหนด", "เลขที่เอกสาร", "หมายเหตุ",
+    try:
+        ws.page_setup.orientation = "landscape"     # พิมพ์แนวนอน
+        ws.page_setup.fitToWidth = 1
+    except Exception:
+        pass
+    headers = ["ลำดับ", "วันครบกำหนด", "แบรนด์", "เลขที่เอกสาร", "ชื่อผู้รับ",
+               "ชื่อโปรเจ็ค/รายละเอียด", "จำนวนเงิน (บาท)", "เลขบัญชี", "หมายเหตุ",
                "ลิงก์", "ลิงก์แก้ไขใบ"]
+    AMT_COL = 7                                  # คอลัมน์ 'จำนวนเงิน'
     thin = Side(style="thin", color="CBD5E1")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     thai = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
@@ -335,17 +341,18 @@ def build_bank_excel_multiday(days: list, cfg: dict, path: str) -> None:
         # รายการ
         for i, e in enumerate(items, 1):
             r += 1
-            row_vals = [i, _vendor_name(e), _exp_brand(e), _vendor_account(e),
-                        _amount(e),
+            row_vals = [i,
                         fmt_date(e.get("dueDate") or e.get("due_date") or ""),
-                        _doc_serial(e), _exp_remark(e), "", ""]
+                        _exp_brand(e), _doc_serial(e), _vendor_name(e),
+                        _exp_project(e), _amount(e), _vendor_account(e),
+                        _exp_remark(e), "", ""]
             for col, val in enumerate(row_vals, 1):
                 cc = ws.cell(r, col, val)
                 cc.font = Font(name="Tahoma", size=10, color="0F172A")
                 cc.border = border
                 if col == 1:
                     cc.alignment = Alignment(horizontal="center", vertical="center")
-                elif col == 5:
+                elif col == AMT_COL:
                     cc.alignment = Alignment(horizontal="right", vertical="center")
                     cc.number_format = "#,##0.00"
                 else:
@@ -365,11 +372,11 @@ def build_bank_excel_multiday(days: list, cfg: dict, path: str) -> None:
                 ec.font = Font(name="Tahoma", size=10, color="DC2626", underline="single")
         # ยอดรวมวัน
         r += 1
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=4)
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=AMT_COL - 1)
         cc = ws.cell(r, 1, f"รวมวันที่ {di}")
         cc.font = Font(name="Tahoma", size=10, bold=True, color="15803D")
         cc.alignment = Alignment(horizontal="right", vertical="center")
-        cc = ws.cell(r, 5, day_total)
+        cc = ws.cell(r, AMT_COL, day_total)
         cc.font = Font(name="Tahoma", size=10, bold=True, color="15803D")
         cc.number_format = "#,##0.00"
         cc.alignment = Alignment(horizontal="right", vertical="center")
@@ -377,25 +384,26 @@ def build_bank_excel_multiday(days: list, cfg: dict, path: str) -> None:
 
     # ยอดรวมใหญ่
     r += 1
-    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=4)
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=AMT_COL - 1)
     cc = ws.cell(r, 1, f"รวมทั้งหมด {sum(len(d['items']) for d in days)} รายการ ({len([d for d in days if d['items']])} วัน)")
     cc.font = Font(name="Tahoma", size=12, bold=True, color="15803D")
     cc.fill = PatternFill("solid", fgColor="DCFCE7")
     cc.alignment = Alignment(horizontal="right", vertical="center")
-    cc = ws.cell(r, 5, grand)
+    cc = ws.cell(r, AMT_COL, grand)
     cc.font = Font(name="Tahoma", size=12, bold=True, color="15803D")
     cc.fill = PatternFill("solid", fgColor="DCFCE7")
     cc.number_format = "#,##0.00"
     cc.alignment = Alignment(horizontal="right", vertical="center")
 
-    for col, w in enumerate([7, 28, 14, 18, 16, 14, 16, 26, 16, 14], 1):
+    # ความกว้างคอลัมน์ (ตามลำดับใหม่ 11 คอลัมน์)
+    for col, w in enumerate([7, 14, 14, 18, 30, 30, 16, 20, 30, 14, 14], 1):
         ws.column_dimensions[get_column_letter(col)].width = w
     wb.save(path)
 
 
 def build_bank_pdf_multiday(days: list, cfg: dict, path: str) -> None:
-    """สร้าง PDF จัดกลุ่มตามวันจ่าย แนวตั้ง (ภาษาไทย ใช้ฟอนต์ Tahoma จากระบบ)"""
-    from reportlab.lib.pagesizes import A4
+    """สร้าง PDF จัดกลุ่มตามวันจ่าย แนวนอน (ภาษาไทย ใช้ฟอนต์ Tahoma จากระบบ)"""
+    from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib import colors
     from reportlab.lib.units import mm
     from reportlab.pdfbase import pdfmetrics
@@ -431,16 +439,18 @@ def build_bank_pdf_multiday(days: list, cfg: dict, path: str) -> None:
     link_st  = ParagraphStyle("lk", parent=styles["Normal"], fontName=fname,
                               fontSize=8, alignment=1)   # กึ่งกลาง
 
-    # แนวตั้ง (portrait A4) — ความกว้างใช้งานจริง ~190mm
-    doc = SimpleDocTemplate(path, pagesize=A4,
+    # แนวนอน (landscape A4) — ความกว้างใช้งานจริง ~277mm
+    doc = SimpleDocTemplate(path, pagesize=landscape(A4),
                             leftMargin=10*mm, rightMargin=10*mm,
                             topMargin=10*mm, bottomMargin=10*mm)
     elems = [Paragraph(f"คิวจ่ายเงิน (หลายวัน) — {cfg.get('company_name','')}", title_st),
              Paragraph(f"วันที่ออกเอกสาร: {fmt_date(today_str())}", sub_st),
              Spacer(1, 6)]
 
-    headers = ["#", "ชื่อผู้รับ", "แบรนด์", "เลขบัญชี", "จำนวนเงิน", "ครบกำหนด", "เลขที่เอกสาร", "หมายเหตุ", "ลิงก์", "แก้ไขใบ"]
-    col_w = [9*mm, 35*mm, 16*mm, 22*mm, 20*mm, 16*mm, 20*mm, 23*mm, 14*mm, 14*mm]
+    headers = ["#", "วันครบกำหนด", "แบรนด์", "เลขที่เอกสาร", "ชื่อผู้รับ",
+               "ชื่อโปรเจ็ค/รายละเอียด", "จำนวนเงิน", "เลขบัญชี", "หมายเหตุ",
+               "ลิงก์", "แก้ไขใบ"]
+    col_w = [8*mm, 20*mm, 20*mm, 24*mm, 44*mm, 44*mm, 22*mm, 26*mm, 33*mm, 15*mm, 15*mm]
     # ให้เลขลำดับอยู่กึ่งกลาง ไม่ตัดบรรทัด (เลข 2 หลักขึ้นไปอยู่บรรทัดเดียว)
     num_st = ParagraphStyle("num", parent=cell_st, alignment=1)
     grand = 0.0
@@ -475,22 +485,23 @@ def build_bank_pdf_multiday(days: list, cfg: dict, path: str) -> None:
                          if edit else Paragraph("-", link_st))
             data.append([
                 Paragraph(str(i), num_st),
-                Paragraph(_vendor_name(e), cell_st),
-                Paragraph(_exp_brand(e), cell_st),
-                Paragraph(_vendor_account(e), cell_st),
-                Paragraph(fmt_amount(_amount(e)), cellr_st),
                 Paragraph(fmt_date(e.get("dueDate") or e.get("due_date") or ""), cell_st),
+                Paragraph(_exp_brand(e), cell_st),
                 Paragraph(_doc_serial(e), cell_st),
+                Paragraph(_vendor_name(e), cell_st),
+                Paragraph(_exp_project(e), cell_st),
+                Paragraph(fmt_amount(_amount(e)), cellr_st),
+                Paragraph(_vendor_account(e), cell_st),
                 Paragraph(_exp_remark(e), cell_st),
                 link_para,
                 edit_para,
             ])
-        data.append([Paragraph("รวมวันนี้", cellr_st), "", "", "",
-                     Paragraph(fmt_amount(day_total), cellr_st), "", "", "", "", ""])
+        data.append([Paragraph("รวมวันนี้", cellr_st), "", "", "", "", "",
+                     Paragraph(fmt_amount(day_total), cellr_st), "", "", "", ""])
         t = Table(data, colWidths=col_w, repeatRows=1)
         t.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dcfce7")),
-            ("SPAN", (0, -1), (3, -1)),
+            ("SPAN", (0, -1), (5, -1)),
             ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#f1f5f9")),
             ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e1")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -633,8 +644,9 @@ def build_bank_html_multiday(days: list, cfg: dict) -> str:
 
     thai = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
     company = _html.escape(cfg.get("company_name", ""))
-    headers = ["#", "ชื่อผู้รับ", "แบรนด์", "เลขบัญชี", "จำนวนเงิน",
-               "ครบกำหนด", "เลขที่เอกสาร", "หมายเหตุ", "ลิงก์", "ลิงก์แก้ไขใบ"]
+    headers = ["#", "วันครบกำหนด", "แบรนด์", "เลขที่เอกสาร", "ชื่อผู้รับ",
+               "ชื่อโปรเจ็ค/รายละเอียด", "จำนวนเงิน", "เลขบัญชี", "หมายเหตุ",
+               "ลิงก์", "ลิงก์แก้ไขใบ"]
 
     def esc(x):
         return _html.escape(str(x or ""))
@@ -646,7 +658,7 @@ def build_bank_html_multiday(days: list, cfg: dict) -> str:
 *{box-sizing:border-box}
 body{font-family:'Segoe UI','Tahoma','Noto Sans Thai',sans-serif;margin:0;padding:24px;
      background:#f1f5f9;color:#0f172a;}
-.wrap{max-width:1100px;margin:0 auto;background:white;padding:24px 28px;border-radius:10px;
+.wrap{max-width:1400px;margin:0 auto;background:white;padding:24px 28px;border-radius:10px;
       box-shadow:0 1px 6px rgba(0,0,0,.08);}
 h1{color:#15803d;font-size:22px;margin:0 0 4px;}
 .sub{color:#64748b;font-size:13px;margin-bottom:18px;}
@@ -692,19 +704,20 @@ a.lk:hover{text-decoration:underline;}
             parts.append(
                 "<tr>"
                 f"<td class='ctr'>{i}</td>"
-                f"<td>{esc(_vendor_name(e))}</td>"
-                f"<td>{esc(_exp_brand(e))}</td>"
-                f"<td>{esc(_vendor_account(e))}</td>"
-                f"<td class='amt'>{esc(fmt_amount(_amount(e)))}</td>"
                 f"<td class='ctr'>{esc(fmt_date(e.get('dueDate') or e.get('due_date') or ''))}</td>"
+                f"<td>{esc(_exp_brand(e))}</td>"
                 f"<td>{esc(_doc_serial(e))}</td>"
+                f"<td>{esc(_vendor_name(e))}</td>"
+                f"<td>{esc(_exp_project(e))}</td>"
+                f"<td class='amt'>{esc(fmt_amount(_amount(e)))}</td>"
+                f"<td>{esc(_vendor_account(e))}</td>"
                 f"<td>{esc(_exp_remark(e))}</td>"
                 f"<td class='ctr'>{link_html}</td>"
                 f"<td class='ctr'>{edit_html}</td>"
                 "</tr>")
         parts.append(
-            f"<tr class='daytotal'><td colspan='4' style='text-align:right'>รวมวันที่ {di}</td>"
-            f"<td class='amt'>{esc(fmt_amount(day_total))}</td><td colspan='5'></td></tr>")
+            f"<tr class='daytotal'><td colspan='6' style='text-align:right'>รวมวันที่ {di}</td>"
+            f"<td class='amt'>{esc(fmt_amount(day_total))}</td><td colspan='4'></td></tr>")
         parts.append("</tbody></table>")
 
     n_items = sum(len(d["items"]) for d in days)
@@ -796,13 +809,45 @@ def _vendor_name(exp: dict) -> str:
 
 
 def _vendor_account(exp: dict) -> str:
-    """พยายามดึงเลขบัญชีธนาคารจาก expense (FlowAccount เก็บใน contactBankAccount)."""
-    return (
-        exp.get("contactBankAccount")
-        or exp.get("bankAccount")
-        or exp.get("bankAccountNumber")
-        or ""
-    )
+    """ดึงเลขบัญชีธนาคารผู้รับ — ไล่หาหลายทาง:
+    1) field ตรง (contactBankAccount ฯลฯ)
+    2) เลขบัญชีที่ระบบเคยจำจากสลิป (account_memory) ตามชื่อผู้จำหน่าย
+    3) ดึงเลขบัญชีจากข้อความ 'หมายเหตุ' (บัญชีมักพิมพ์ไว้ที่นี่)"""
+    direct = (exp.get("contactBankAccount") or exp.get("bankAccount")
+              or exp.get("bankAccountNumber") or "")
+    if direct:
+        return str(direct)
+    # 2) reverse lookup จากที่ระบบเรียนรู้เลขบัญชี (จากการตัดบิล/จับคู่สลิป)
+    try:
+        import account_memory
+        acct = account_memory.lookup_account_by_name(_vendor_name(exp))
+        if acct:
+            return acct
+    except Exception:
+        pass
+    # 3) ดึงจากหมายเหตุ/โน้ต — เลขบัญชีมักถูกพิมพ์ไว้ (เช่น '035-110-2438', '409 052 0705')
+    text = " ".join(str(exp.get(k) or "") for k in
+                    ("_custom_remark", "remarks", "internalNotes", "note"))
+    for m in re.findall(r"\d[\d\s\-]{7,}\d", text):
+        digits = re.sub(r"\D", "", m)
+        if 9 <= len(digits) <= 13:            # เลขบัญชีไทยมัก 10 หลัก (กันเลขภาษี 13/โทร)
+            return re.sub(r"\s+", "", m).strip("-")
+    return ""
+
+
+def _exp_project(exp: dict) -> str:
+    """ชื่อโปรเจ็ค + รายละเอียด (สำหรับคอลัมน์ 'ชื่อโปรเจ็ค/รายละเอียด')"""
+    proj = str(exp.get("projectName") or "").strip()
+    detail = ""
+    items = exp.get("items") or []
+    if items:
+        it = items[0]
+        detail = str(it.get("description") or it.get("nameLocal")
+                     or it.get("nameForeign") or "").strip()
+    if not detail:
+        detail = str(exp.get("_detail") or exp.get("detail") or "").strip()
+    parts = [p for p in (proj, detail) if p]
+    return " / ".join(parts)
 
 
 def _amount(exp: dict) -> float:
