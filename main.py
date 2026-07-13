@@ -730,7 +730,8 @@ class QueuePlanDialog(QDialog):
     • กด "เลือกวันนี้ไปจ่าย" เพื่อ tick รายการของวันที่เลือกกลับไปหน้าหลัก
     """
 
-    def __init__(self, candidates, daily_limit, assignments=None, parent=None):
+    def __init__(self, candidates, daily_limit, assignments=None, parent=None,
+                 preset_days=None, preset_dates=None):
         super().__init__(parent)
         self.setWindowTitle("📋 ตารางคิวจ่าย (หลายวัน)")
         self.resize(940, 640)
@@ -745,8 +746,16 @@ class QueuePlanDialog(QDialog):
         self._saved_at = ""
         self._day_dates_override = {}   # {index วัน: 'yyyy-mm-dd'} วันจ่ายที่ผู้ใช้กำหนดเอง
 
-        # โหลดการจัดเรียงที่บันทึกไว้ (ถ้ามี) ไม่งั้นกระจายอัตโนมัติ
-        self._days = self._load_or_distribute(candidates)
+        if preset_days is not None:
+            # โหมดแก้ไขจากประวัติ — ใช้การจัดเรียง/วันที่ตามที่ส่งมา (ไม่โหลดแผนปัจจุบัน)
+            self._days = [list(g) for g in preset_days if g] or [[]]
+            if preset_dates:
+                self._day_dates_override = {
+                    i: str(iso)[:10] for i, iso in enumerate(preset_dates) if iso}
+            self._saved_at = ""
+        else:
+            # โหลดการจัดเรียงที่บันทึกไว้ (ถ้ามี) ไม่งั้นกระจายอัตโนมัติ
+            self._days = self._load_or_distribute(candidates)
 
         lay = QVBoxLayout(self)
 
@@ -1689,41 +1698,54 @@ class QueueHistoryDialog(QDialog):
         return out
 
     def _show_detail(self, row, col):
-        if col == 0:            # คอลัมน์ติ๊กเลือก → ไม่เปิดรายละเอียด
+        """ดับเบิลคลิกประวัติ → เปิดหน้าตารางคิวแบบ 'แก้ไขได้' (จับคู่บิลจริง + วันเดิม)"""
+        if col == 0:            # คอลัมน์ติ๊กเลือก → ไม่เปิด
             return
         if not (0 <= row < len(self._rows)):
             return
         r = self._rows[row]
         items = r.get("items") or []
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"รายละเอียดคิว — {str(r.get('time','')).replace('T',' ')[:19]}")
-        dlg.resize(680, 480)
-        dl = QVBoxLayout(dlg)
-        dl.addWidget(QLabel(r.get("detail", "")))
-        t = QTableWidget(0, 5)
-        t.setHorizontalHeaderLabels(["วันที่", "วัน", "เลขเอกสาร", "ผู้รับเงิน", "ยอด (บาท)"])
-        t.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        t.setColumnWidth(0, 100); t.setColumnWidth(1, 50); t.setColumnWidth(2, 120)
-        t.setColumnWidth(4, 110)
-        t.verticalHeader().setVisible(False)
-        t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        if not items:
+            QMessageBox.information(self, "ไม่มีรายการ", "ประวัตินี้ไม่มีรายการ")
+            return
+
+        # บิลจริงจากหน้าคิว (parent = QueueTab) → แก้ไขได้เต็มรูปแบบ
+        qt = self.parent()
+        by_doc = {}
+        for e in getattr(qt, "_expenses", []) or []:
+            by_doc[_doc_no(e)] = e
+
+        from collections import OrderedDict
+        groups = OrderedDict()
+        gdate = {}
         for it in items:
-            rr = t.rowCount(); t.insertRow(rr)
-            cells = [fmt_date(it.get("date", "")) if it.get("date") else "—",
-                     str(it.get("day", "")),
-                     it.get("doc", ""), it.get("vendor", ""),
-                     fmt_amount(it.get("amount", 0))]
-            for c, v in enumerate(cells):
-                cell = QTableWidgetItem(v)
-                if c == 4:
-                    cell.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                t.setItem(rr, c, cell)
-        dl.addWidget(t, 1)
-        total = sum(float(it.get("amount", 0) or 0) for it in items)
-        dl.addWidget(QLabel(f"รวม {len(items)} รายการ • {fmt_amount(total)} บาท"))
-        btn = QPushButton("ปิด"); btn.clicked.connect(dlg.accept)
-        dl.addWidget(btn)
+            dno = int(it.get("day", 1) or 1)
+            groups.setdefault(dno, [])
+            doc = it.get("doc", "")
+            e = by_doc.get(doc)
+            if e is None:
+                # บิลนี้อาจถูกจ่าย/ลบไปแล้ว → สร้างตัวแทนจากประวัติ (แก้เรียง/บันทึกได้)
+                e = {"contactName": it.get("vendor", ""),
+                     "grandTotal": float(it.get("amount", 0) or 0),
+                     "documentSerial": doc, "id": doc or f"hist{dno}_{len(groups[dno])}",
+                     "_brand_name": it.get("brand", ""),
+                     "dueDate": "", "_history_only": True}
+            groups[dno].append(e)
+            if it.get("date"):
+                gdate[dno] = str(it["date"])[:10]
+
+        keys = sorted(groups)
+        preset_days = [groups[k] for k in keys]
+        preset_dates = [gdate.get(k, "") for k in keys]
+
+        assignments = load_brands()
+        dlim = getattr(qt, "_daily_limit", 150000) or 150000
+        dlg = QueuePlanDialog([], dlim, assignments, self,
+                              preset_days=preset_days, preset_dates=preset_dates)
+        dlg.setWindowTitle(
+            f"📋 แก้ไขคิว (จากประวัติ {str(r.get('time','')).replace('T',' ')[:16]})")
         dlg.exec()
+        self._reload()   # เผื่อมีการบันทึกคิวใหม่
 
     def _selected_history(self):
         # ใช้แถวที่ติ๊ก (ถ้าติ๊กหลายอันจะใช้อันแรก) ไม่งั้นใช้แถวที่คลิกเลือก
@@ -8165,7 +8187,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "3.99"
+APP_VERSION = "4.0"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8543,6 +8565,16 @@ CHANGELOG = [
             "จัดคอลัมน์ใหม่: #/วันครบกำหนด/แบรนด์/เลขที่เอกสาร/ชื่อผู้รับ/ชื่อโปรเจ็ค-รายละเอียด/จำนวนเงิน/เลขบัญชี/หมายเหตุ/ลิงก์/แก้ไขใบ",
             "เพิ่มคอลัมน์ 'ชื่อโปรเจ็ค/รายละเอียด'",
             "เติมเลขบัญชีอัตโนมัติ (จากที่ระบบจำ + ดึงจากหมายเหตุ)",
+        ],
+    },
+    {
+        "version": "4.0",
+        "date": "13/07/2569",
+        "title": "ประวัติการจัดคิว: ดับเบิลคลิกเข้าไปแก้ไข + บันทึกได้",
+        "items": [
+            "ดับเบิลคลิกรายการในหน้าประวัติ → เปิดหน้าตารางคิว (หลายวัน) แบบแก้ไขได้",
+            "จับคู่กับบิลจริงในระบบ (ย้ายวัน/เปลี่ยนวันจ่าย/หมายเหตุ ได้เต็มรูปแบบ)",
+            "กด 'บันทึกคิว' หรือปิด = บันทึกการแก้ไข (ลงประวัติใหม่)",
         ],
     },
 ]
