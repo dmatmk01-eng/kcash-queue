@@ -800,6 +800,14 @@ class QueuePlanDialog(QDialog):
         self.btn_save_queue.clicked.connect(self._save_queue)
         tb2.addWidget(self.btn_save_queue)
 
+        self.btn_add_item = QPushButton("➕ เพิ่มรายการเข้าคิว")
+        self.btn_add_item.setStyleSheet(
+            "QPushButton{padding:5px 14px;border:none;border-radius:4px;"
+            "background:#16a34a;color:white;font-size:12px;font-weight:700;}"
+            "QPushButton:hover{background:#15803d;}")
+        self.btn_add_item.clicked.connect(self._add_item_dialog)
+        tb2.addWidget(self.btn_add_item)
+
         self.btn_mark_pending = QPushButton("✅ Mark จ่ายแล้ว (รออัพเดต FlowAccount)")
         self.btn_mark_pending.setStyleSheet(
             "QPushButton{padding:5px 14px;border:none;border-radius:4px;"
@@ -1349,6 +1357,123 @@ class QueuePlanDialog(QDialog):
         else:
             return
         self._render()
+
+    def _find_queuetab(self):
+        """หา QueueTab (แหล่งบิลทั้งหมด) จาก parent chain — ใช้ตอนเพิ่มรายการเข้าคิว"""
+        w = self.parent()
+        while w is not None and not hasattr(w, "_expenses"):
+            w = w.parent()
+        return w
+
+    def _add_item_dialog(self):
+        """เพิ่มรายการ (บิล) เข้าคิวเอง — ค้นหา/เลือกบิลที่ยังไม่อยู่ในคิว แล้วกดตกลง"""
+        qt = self._find_queuetab()
+        pool = list(getattr(qt, "_expenses", []) or []) if qt else []
+        if not pool:
+            QMessageBox.information(self, "ไม่มีข้อมูลบิล",
+                "ยังไม่มีข้อมูลบิลในระบบ — กด 🔄 รีเฟรช ในหน้าคิวก่อนครับ")
+            return
+        in_ids = {_exp_id(e) for grp in self._days for e in grp}
+        avail = [e for e in pool
+                 if _exp_id(e) not in in_ids and _amount(e) > 0
+                 and _status(e) != "paid"
+                 and not paid_pending.is_pending(_exp_id(e))
+                 and not rejected.is_rejected(_exp_id(e))]
+        if not avail:
+            QMessageBox.information(self, "ไม่มีรายการให้เพิ่ม",
+                "บิลที่ยังไม่จ่ายทุกรายการอยู่ในคิวแล้ว")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("➕ เพิ่มรายการเข้าคิว")
+        dlg.resize(760, 520)
+        v = QVBoxLayout(dlg)
+        v.addWidget(QLabel("ค้นหาแล้วติ๊ก ☑ บิลที่จะเพิ่มเข้าคิว แล้วกด «เพิ่มเข้าคิว»"))
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("🔍"))
+        ed = QLineEdit(); ed.setPlaceholderText("พิมพ์ชื่อผู้รับ หรือเลขเอกสาร (บางส่วนก็ได้)")
+        ed.setClearButtonEnabled(True)
+        srow.addWidget(ed)
+        srow.addWidget(QLabel("→ ใส่วันที่"))
+        sp = QSpinBox(); sp.setMinimum(1); sp.setMaximum(max(1, len(self._days)))
+        sp.setValue(1); sp.setFixedWidth(60)
+        srow.addWidget(sp)
+        v.addLayout(srow)
+
+        tbl = QTableWidget(0, 5)
+        tbl.setHorizontalHeaderLabels(["✓", "เลขเอกสาร", "ผู้รับเงิน", "แบรนด์", "ยอด (บาท)"])
+        tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        tbl.setColumnWidth(0, 34); tbl.setColumnWidth(1, 130)
+        tbl.setColumnWidth(3, 110); tbl.setColumnWidth(4, 110)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        v.addWidget(tbl, 1)
+
+        row_exp = []   # (row_widget_item, expense)
+
+        def _fill(flt=""):
+            tbl.setRowCount(0)
+            row_exp.clear()
+            terms = [t for t in re.split(r"[,\s]+", flt.lower()) if t]
+            for e in avail:
+                blob = (_vendor(e) + " " + _doc_no(e)).lower()
+                if terms and not all(t in blob for t in terms):
+                    continue
+                rr = tbl.rowCount(); tbl.insertRow(rr)
+                chk = QTableWidgetItem()
+                chk.setFlags((chk.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                             & ~Qt.ItemFlag.ItemIsEditable)
+                chk.setCheckState(Qt.CheckState.Unchecked)
+                tbl.setItem(rr, 0, chk)
+                cells = [_doc_no(e), _vendor(e) or "—",
+                         _brand_name(e, self._assignments) or "—", fmt_amount(_amount(e))]
+                for c, val in enumerate(cells, 1):
+                    itc = QTableWidgetItem(val)
+                    itc.setFlags(itc.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    if c == 4:
+                        itc.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    tbl.setItem(rr, c, itc)
+                row_exp.append((rr, e))
+        _fill()
+        ed.textChanged.connect(lambda: _fill(ed.text()))
+        tbl.cellDoubleClicked.connect(lambda r, c: tbl.item(r, 0).setCheckState(
+            Qt.CheckState.Unchecked if tbl.item(r, 0).checkState() == Qt.CheckState.Checked
+            else Qt.CheckState.Checked))
+
+        brow = QHBoxLayout()
+        b_ok = QPushButton("➕ เพิ่มเข้าคิว")
+        b_ok.setStyleSheet("QPushButton{background:#16a34a;color:white;border:none;"
+                           "border-radius:5px;padding:6px 16px;font-weight:600;}")
+        b_cancel = QPushButton("ยกเลิก")
+        brow.addStretch(); brow.addWidget(b_ok); brow.addWidget(b_cancel)
+        v.addLayout(brow)
+        b_cancel.clicked.connect(dlg.reject)
+
+        def _do_add():
+            picked = []
+            for rr, e in row_exp:
+                it0 = tbl.item(rr, 0)
+                if it0 is not None and it0.checkState() == Qt.CheckState.Checked:
+                    picked.append(e)
+            if not picked:
+                QMessageBox.information(dlg, "ยังไม่ได้เลือก", "ติ๊ก ☑ บิลที่จะเพิ่มก่อนครับ")
+                return
+            day_idx = min(sp.value() - 1, len(self._days) - 1)
+            already = {_exp_id(e) for grp in self._days for e in grp}
+            n = 0
+            for e in picked:
+                if _exp_id(e) in already:
+                    continue
+                self._days[day_idx].append(e)
+                already.add(_exp_id(e))
+                n += 1
+            dlg.accept()
+            self._render()
+            self._update_buttons()
+            self.lbl_hint.setText(f"➕ เพิ่ม {n} รายการเข้าวันที่ {day_idx + 1} แล้ว "
+                                  "(อย่าลืมกด 💾 บันทึกคิว)")
+        b_ok.clicked.connect(_do_add)
+        dlg.exec()
 
     def _on_tree_clicked(self, item, col):
         """คลิกคอลัมน์เลขเอกสาร (1) → คัดลอกรหัส EXP/PO (ข้อ 4)"""
@@ -8201,7 +8326,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.0.1"
+APP_VERSION = "4.1"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8598,6 +8723,16 @@ CHANGELOG = [
         "items": [
             "แก้ไขคิวจากประวัติแล้วบันทึก = อัปเดต 'อันเดิม' (ไม่สร้างประวัติใหม่ซ้ำๆ)",
             "การแก้ไขประวัติไม่ไปทับแผนคิวปัจจุบัน (แยกกันชัดเจน)",
+        ],
+    },
+    {
+        "version": "4.1",
+        "date": "13/07/2569",
+        "title": "ตารางคิว: เพิ่มปุ่ม 'เพิ่มรายการเข้าคิว'",
+        "items": [
+            "เพิ่มปุ่ม '➕ เพิ่มรายการเข้าคิว' ในตารางคิวจ่าย + ตารางแก้ไขประวัติ",
+            "กดแล้วเด้งหน้าต่าง ค้นหา/ติ๊กเลือกบิลที่ยังไม่อยู่ในคิว แล้วกด 'เพิ่มเข้าคิว'",
+            "เลือกได้ว่าจะใส่เข้าวันที่ไหน — เพิ่มแล้วอย่าลืมกด 'บันทึกคิว'",
         ],
     },
 ]
