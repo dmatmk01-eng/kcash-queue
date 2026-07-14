@@ -731,9 +731,11 @@ class QueuePlanDialog(QDialog):
     """
 
     def __init__(self, candidates, daily_limit, assignments=None, parent=None,
-                 preset_days=None, preset_dates=None):
+                 preset_days=None, preset_dates=None, history_edit_time=None):
         super().__init__(parent)
         self.setWindowTitle("📋 ตารางคิวจ่าย (หลายวัน)")
+        # ถ้าตั้งค่านี้ = โหมด 'แก้ไขประวัติ' → บันทึกทับอันเดิม ไม่สร้างประวัติใหม่/ไม่ทับคิวปัจจุบัน
+        self._history_edit_time = history_edit_time
         self.resize(940, 640)
         # ให้ย่อหน้าต่าง (minimize) ได้ — requirement ข้อ 5
         self.setWindowFlags(self.windowFlags()
@@ -1494,13 +1496,24 @@ class QueuePlanDialog(QDialog):
                               "amount": _amount(e), "brand": _brand_name(e, self._assignments),
                               "day": di, "date": d.isoformat()})
         n_days = len([g for g in self._days if g])
+        detail = f"บันทึกคิว {n_days} วัน {len(items)} รายการ"
+
+        # โหมดแก้ไขประวัติ → อัปเดต 'อันเดิม' ไม่สร้างใหม่ + ไม่ทับคิวปัจจุบัน
+        if getattr(self, "_history_edit_time", None):
+            ok = activity_log.update_queue_log(self._history_edit_time,
+                                               f"แก้ไขคิว {n_days} วัน {len(items)} รายการ",
+                                               items=items)
+            if not ok:   # หาอันเดิมไม่เจอ (ถูกลบ) → ค่อยสร้างใหม่
+                activity_log.log_queue(detail, items=items)
+            self._saved_at = datetime.now().isoformat(timespec="seconds")
+            return len(items)
+
         now_iso = datetime.now().isoformat(timespec="seconds")
         days_ids = [[_exp_id(e) for e in grp] for grp in self._days]
         queue_plan.save_plan(days_ids, now_iso,
                              dates=[d.isoformat() for d in dates])
         self._saved_at = now_iso
-        activity_log.log_queue(
-            f"บันทึกคิว {n_days} วัน {len(items)} รายการ", items=items)
+        activity_log.log_queue(detail, items=items)
         activity_log.log("บันทึกคิว", f"{n_days} วัน {len(items)} รายการ")
         return len(items)
 
@@ -1741,7 +1754,8 @@ class QueueHistoryDialog(QDialog):
         assignments = load_brands()
         dlim = getattr(qt, "_daily_limit", 150000) or 150000
         dlg = QueuePlanDialog([], dlim, assignments, self,
-                              preset_days=preset_days, preset_dates=preset_dates)
+                              preset_days=preset_days, preset_dates=preset_dates,
+                              history_edit_time=r.get("time", ""))
         dlg.setWindowTitle(
             f"📋 แก้ไขคิว (จากประวัติ {str(r.get('time','')).replace('T',' ')[:16]})")
         dlg.exec()
@@ -8187,7 +8201,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.0"
+APP_VERSION = "4.0.1"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8575,6 +8589,15 @@ CHANGELOG = [
             "ดับเบิลคลิกรายการในหน้าประวัติ → เปิดหน้าตารางคิว (หลายวัน) แบบแก้ไขได้",
             "จับคู่กับบิลจริงในระบบ (ย้ายวัน/เปลี่ยนวันจ่าย/หมายเหตุ ได้เต็มรูปแบบ)",
             "กด 'บันทึกคิว' หรือปิด = บันทึกการแก้ไข (ลงประวัติใหม่)",
+        ],
+    },
+    {
+        "version": "4.0.1",
+        "date": "13/07/2569",
+        "title": "แก้ไขประวัติ: บันทึกทับอันเดิม ไม่เพิ่มรายการใหม่",
+        "items": [
+            "แก้ไขคิวจากประวัติแล้วบันทึก = อัปเดต 'อันเดิม' (ไม่สร้างประวัติใหม่ซ้ำๆ)",
+            "การแก้ไขประวัติไม่ไปทับแผนคิวปัจจุบัน (แยกกันชัดเจน)",
         ],
     },
 ]
