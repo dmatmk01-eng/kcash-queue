@@ -172,7 +172,7 @@ def _sync_local_to_cloud():
 
 def authenticate(username: str, password: str):
     """คืน user dict ถ้าถูกต้อง ไม่งั้น None
-    เช็ค cloud ก่อน → fallback local"""
+    เช็ค cloud ก่อน → fallback local → sync ทุกครั้ง"""
     username = (username or "").strip()
     if not username:
         return None
@@ -186,6 +186,15 @@ def authenticate(username: str, password: str):
         if u["username"].lower() == username.lower():
             if _hash_pw(password, u["salt"]) == u["pwhash"]:
                 _sync_local_to_cloud()
+                try:
+                    import cloud_log
+                    cloud_log.upsert_user_async(_cloud_cfg(), {
+                        "username": u["username"], "salt": u["salt"],
+                        "pwhash": u["pwhash"], "fullname": u["fullname"],
+                        "nickname": u["nickname"], "role": u["role"],
+                    })
+                except Exception:
+                    pass
                 return {k: v for k, v in u.items() if k not in ("salt", "pwhash")}
             return None
     return None
