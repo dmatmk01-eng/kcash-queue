@@ -57,6 +57,7 @@ import rejected
 import users
 import remarks
 import share_links
+import config
 
 
 def _resource_path(rel_path: str) -> str:
@@ -7268,13 +7269,18 @@ class GoodsReceiptTab(QWidget):
 # ──────────────────── Log Tab (Activity / Queue) ────────────────────
 
 class LogTab(QWidget):
-    """หน้า Log — สลับดู Activity Log / Queue Log + ค้นหา + Export
-    เตรียมรากฐานสำหรับระบบ login admin/user ในอนาคต"""
+    """หน้า Log — Activity / Queue + Cloud (Supabase)
+    Dropdown user, ปฏิทินช่วงเวลา, ดาวน์โหลด PDF, ห้ามลบ/แก้ไข
+    admin/dev ดู log ทุก user ได้ — user ดูได้แค่ของตัวเอง"""
     status_message = pyqtSignal(str)
 
-    def __init__(self):
+    def __init__(self, current_user=None):
         super().__init__()
+        self._current_user = current_user or {}
+        self._role = self._current_user.get("role", "user")
+        self._nickname = self._current_user.get("nickname", "") or self._current_user.get("username", "")
         self._mode = "activity"   # activity | queue
+        self._rows = []
         self._build_ui()
         self.reload()
 
@@ -7283,6 +7289,11 @@ class LogTab(QWidget):
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
 
+        _lbl_style = "font-size:12px;color:#1e293b;"
+        _input_style = ("font-size:12px;color:#1e293b;background:white;"
+                        "border:1px solid #cbd5e1;border-radius:4px;padding:3px 6px;")
+
+        # ── Row 1: mode tabs + downloads + cloud setup ──
         tb = QHBoxLayout()
         self.btn_activity = QPushButton("👤 Activity Log")
         self.btn_queue    = QPushButton("📋 Log การจัดคิว")
@@ -7290,48 +7301,145 @@ class LogTab(QWidget):
         self.btn_activity.setChecked(True)
         self.btn_activity.clicked.connect(lambda: self._switch("activity"))
         self.btn_queue.clicked.connect(lambda: self._switch("queue"))
+        _tab_style = ("QPushButton{padding:6px 14px;border:1px solid #94a3b8;border-radius:5px;"
+                      "background:white;font-size:12px;font-weight:600;color:#334155;}"
+                      "QPushButton:checked{background:#16a34a;color:white;border-color:#16a34a;}")
         for b in (self.btn_activity, self.btn_queue):
-            b.setStyleSheet(
-                "QPushButton{padding:6px 14px;border:1px solid #cbd5e1;border-radius:5px;"
-                "background:white;font-size:12px;font-weight:600;}"
-                "QPushButton:checked{background:#16a34a;color:white;border-color:#16a34a;}")
+            b.setStyleSheet(_tab_style)
         tb.addWidget(self.btn_activity)
         tb.addWidget(self.btn_queue)
-        tb.addSpacing(16)
-
-        self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("🔍 ค้นหา วันที่ / ผู้ใช้ / รายการ")
-        self.search_box.setClearButtonEnabled(True)
-        self.search_box.setFixedWidth(280)
-        self.search_box.textChanged.connect(self._render)
-        tb.addWidget(self.search_box)
         tb.addStretch()
-        self.btn_refresh = QPushButton("🔄 รีเฟรช")
-        self.btn_export  = QPushButton("⬇️ Export CSV")
-        self.btn_pdf     = QPushButton("🖨️ บันทึก PDF")
-        for b in (self.btn_refresh, self.btn_export):
-            b.setStyleSheet("QPushButton{padding:6px 12px;border:1px solid #cbd5e1;border-radius:5px;background:white;font-size:12px;}")
-        self.btn_pdf.setStyleSheet(
-            "QPushButton{padding:6px 12px;border:none;border-radius:5px;"
-            "background:#dc2626;color:white;font-size:12px;font-weight:600;}")
-        self.btn_pdf.setToolTip("บันทึก Log เป็นไฟล์ PDF (แก้ไขไม่ได้) ไว้ดูย้อนหลัง")
-        self.btn_refresh.clicked.connect(self.reload)
-        self.btn_export.clicked.connect(self._export)
-        self.btn_pdf.clicked.connect(self._export_pdf)
-        tb.addWidget(self.btn_refresh)
-        tb.addWidget(self.btn_export)
-        tb.addWidget(self.btn_pdf)
+
+        _dl_style = ("QPushButton{padding:6px 14px;border:none;border-radius:5px;"
+                     "background:#2563eb;color:white;font-size:12px;font-weight:600;}")
+        self.btn_dl_activity = QPushButton("⬇️ ดาวน์โหลด Log Activity")
+        self.btn_dl_queue    = QPushButton("⬇️ ดาวน์โหลด Log การจัดคิว")
+        self.btn_dl_activity.setStyleSheet(_dl_style)
+        self.btn_dl_queue.setStyleSheet(_dl_style)
+        self.btn_dl_activity.clicked.connect(lambda: self._download_pdf("activity"))
+        self.btn_dl_queue.clicked.connect(lambda: self._download_pdf("queue"))
+        tb.addWidget(self.btn_dl_activity)
+        tb.addWidget(self.btn_dl_queue)
+        tb.addSpacing(8)
+
+        self.btn_cloud_setup = QPushButton("⚙️ ตั้งค่า Cloud")
+        self.btn_cloud_setup.setStyleSheet(
+            "QPushButton{padding:6px 12px;border:1px solid #94a3b8;border-radius:5px;"
+            "background:white;font-size:12px;color:#334155;}")
+        self.btn_cloud_setup.clicked.connect(self._cloud_setup)
+        if self._role not in ("admin", "dev"):
+            self.btn_cloud_setup.setVisible(False)
+        tb.addWidget(self.btn_cloud_setup)
         lay.addLayout(tb)
 
+        # ── Row 2: filters — user dropdown + date range + search + refresh ──
+        fr = QHBoxLayout()
+        lbl_user = QLabel("👤 ผู้ใช้:")
+        lbl_user.setStyleSheet(_lbl_style)
+        fr.addWidget(lbl_user)
+        self.cmb_user = QComboBox()
+        self.cmb_user.setFixedWidth(140)
+        self.cmb_user.setStyleSheet(_input_style)
+        self.cmb_user.addItem("ทั้งหมด", "")
+        self.cmb_user.currentIndexChanged.connect(lambda: self.reload())
+        fr.addWidget(self.cmb_user)
+        if self._role not in ("admin", "dev"):
+            self.cmb_user.setVisible(False)
+            lbl_user.setText(f"👤 {self._nickname}")
+        fr.addSpacing(12)
+
+        lbl_from = QLabel("📅 จาก:")
+        lbl_from.setStyleSheet(_lbl_style)
+        fr.addWidget(lbl_from)
+        _en_locale = QLocale(QLocale.Language.English, QLocale.Country.UnitedStates)
+        self.de_from = QDateEdit()
+        self.de_from.setCalendarPopup(True)
+        self.de_from.setDate(QDate.currentDate().addDays(-30))
+        self.de_from.setDisplayFormat("dd/MM/yyyy")
+        self.de_from.setLocale(_en_locale)
+        self.de_from.setFixedWidth(120)
+        self.de_from.setStyleSheet(_input_style)
+        fr.addWidget(self.de_from)
+        lbl_to = QLabel("ถึง:")
+        lbl_to.setStyleSheet(_lbl_style)
+        fr.addWidget(lbl_to)
+        self.de_to = QDateEdit()
+        self.de_to.setCalendarPopup(True)
+        self.de_to.setDate(QDate.currentDate())
+        self.de_to.setDisplayFormat("dd/MM/yyyy")
+        self.de_to.setLocale(_en_locale)
+        self.de_to.setFixedWidth(120)
+        self.de_to.setStyleSheet(_input_style)
+        fr.addWidget(self.de_to)
+        fr.addSpacing(12)
+
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("🔍 ค้นหา")
+        self.search_box.setClearButtonEnabled(True)
+        self.search_box.setFixedWidth(200)
+        self.search_box.setStyleSheet(_input_style)
+        self.search_box.textChanged.connect(self._render)
+        fr.addWidget(self.search_box)
+        fr.addStretch()
+
+        self.btn_refresh = QPushButton("🔄 รีเฟรช")
+        self.btn_refresh.setStyleSheet(
+            "QPushButton{padding:6px 12px;border:1px solid #94a3b8;border-radius:5px;"
+            "background:white;font-size:12px;color:#334155;}")
+        self.btn_refresh.clicked.connect(self.reload)
+        fr.addWidget(self.btn_refresh)
+        lay.addLayout(fr)
+
+        # ── Cloud status banner ──
+        self.cloud_banner = QLabel("")
+        self.cloud_banner.setStyleSheet(
+            "padding:4px 10px;background:#dbeafe;border:1px solid #93c5fd;"
+            "border-radius:4px;font-size:11px;color:#1e40af;")
+        self.cloud_banner.setVisible(False)
+        lay.addWidget(self.cloud_banner)
+
+        # ── Table ──
         self.table = QTableWidget(0, 5)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setStyleSheet("QTableWidget{border:1px solid #e2e8f0;font-size:12px;}")
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setStyleSheet(
+            "QTableWidget{border:1px solid #cbd5e1;font-size:12px;color:#1e293b;background:white;}"
+            "QHeaderView::section{background:#f1f5f9;color:#334155;font-weight:600;"
+            "border:1px solid #cbd5e1;padding:4px;font-size:12px;}")
         lay.addWidget(self.table)
 
         self.lbl_count = QLabel("")
-        self.lbl_count.setStyleSheet(f"color:{C_MUTED};font-size:11px;")
+        self.lbl_count.setStyleSheet("color:#475569;font-size:11px;")
         lay.addWidget(self.lbl_count)
+
+        self._populate_users()
+
+    def _populate_users(self):
+        local_users = set()
+        for r in activity_log.load_activity():
+            u = r.get("user", "")
+            if u:
+                local_users.add(u)
+        try:
+            import cloud_log
+            cfg = config.load_config()
+            if cloud_log.is_configured(cfg):
+                for u in cloud_log.fetch_distinct_users(cfg):
+                    local_users.add(u)
+        except Exception:
+            pass
+        self.cmb_user.blockSignals(True)
+        current = self.cmb_user.currentData()
+        self.cmb_user.clear()
+        self.cmb_user.addItem("ทั้งหมด", "")
+        for u in sorted(local_users):
+            self.cmb_user.addItem(u, u)
+        if current:
+            idx = self.cmb_user.findData(current)
+            if idx >= 0:
+                self.cmb_user.setCurrentIndex(idx)
+        self.cmb_user.blockSignals(False)
 
     def _switch(self, mode):
         self._mode = mode
@@ -7339,9 +7447,84 @@ class LogTab(QWidget):
         self.btn_queue.setChecked(mode == "queue")
         self.reload()
 
+    def _date_range(self):
+        d1 = self.de_from.date().toString("yyyy-MM-dd")
+        d2 = self.de_to.date().toString("yyyy-MM-dd")
+        return d1, d2
+
     def reload(self):
-        self._rows = (activity_log.load_activity() if self._mode == "activity"
+        if self._role not in ("admin", "dev"):
+            user_filter = self._nickname
+        else:
+            user_filter = self.cmb_user.currentData() or ""
+        d1, d2 = self._date_range()
+
+        local_rows = (activity_log.load_activity() if self._mode == "activity"
                       else activity_log.load_queue_log())
+        filtered = []
+        for r in local_rows:
+            t = r.get("time", "")[:10]
+            if t and t < d1:
+                continue
+            if t and t > d2:
+                continue
+            if user_filter and r.get("user", "") != user_filter:
+                continue
+            filtered.append(r)
+
+        cloud_rows = []
+        try:
+            import cloud_log
+            cfg = config.load_config()
+            if cloud_log.is_configured(cfg):
+                if self._mode == "activity":
+                    raw = cloud_log.fetch_activity_logs(cfg, user=user_filter,
+                                                        date_from=d1, date_to=d2)
+                    for cr in raw:
+                        cloud_rows.append({
+                            "time": cr.get("timestamp", ""),
+                            "user": cr.get("username", ""),
+                            "action": cr.get("action", ""),
+                            "detail": cr.get("detail", ""),
+                            "company": cr.get("company", ""),
+                            "machine": cr.get("machine", ""),
+                            "_src": "cloud",
+                        })
+                else:
+                    raw = cloud_log.fetch_queue_logs(cfg, user=user_filter,
+                                                     date_from=d1, date_to=d2)
+                    for cr in raw:
+                        cloud_rows.append({
+                            "time": cr.get("timestamp", ""),
+                            "user": cr.get("username", ""),
+                            "detail": cr.get("detail", ""),
+                            "company": cr.get("company", ""),
+                            "count": cr.get("item_count", ""),
+                            "items": cr.get("items", "[]"),
+                            "machine": cr.get("machine", ""),
+                            "_src": "cloud",
+                        })
+                self.cloud_banner.setText(f"☁️ Cloud: {len(cloud_rows)} รายการ | Local: {len(filtered)} รายการ")
+                self.cloud_banner.setVisible(True)
+            else:
+                self.cloud_banner.setVisible(False)
+        except Exception:
+            self.cloud_banner.setVisible(False)
+
+        seen_times = set()
+        merged = []
+        for r in cloud_rows:
+            key = (r.get("time", ""), r.get("user", ""), r.get("action", r.get("detail", "")))
+            seen_times.add(key)
+            merged.append(r)
+        for r in filtered:
+            t = r.get("time", "").replace("T", " ")
+            key = (t, r.get("user", ""), r.get("action", r.get("detail", "")))
+            if key not in seen_times:
+                merged.append(r)
+
+        merged.sort(key=lambda x: x.get("time", ""), reverse=True)
+        self._rows = merged
         self._render()
 
     def _render(self):
@@ -7351,19 +7534,34 @@ class LogTab(QWidget):
                     ("company", "บริษัท"), ("detail", "รายละเอียด")]
         else:
             cols = [("time", "เวลา"), ("user", "ผู้ใช้"), ("count", "จำนวน"),
-                    ("company", "บริษัท"), ("detail", "รายละเอียด")]
+                    ("detail", "รายละเอียด"), ("_link", "ดูรายละเอียด")]
         self.table.setColumnCount(len(cols))
         self.table.setHorizontalHeaderLabels([c[1] for c in cols])
-        self.table.horizontalHeader().setSectionResizeMode(len(cols) - 1, QHeaderView.ResizeMode.Stretch)
+        detail_col = len(cols) - 2 if self._mode == "queue" else len(cols) - 1
+        self.table.horizontalHeader().setSectionResizeMode(
+            detail_col, QHeaderView.ResizeMode.Stretch)
         self.table.setColumnWidth(0, 150)
-        self.table.setColumnWidth(1, 110)
-        self.table.setColumnWidth(2, 110)
-        self.table.setColumnWidth(3, 130)
+        self.table.setColumnWidth(1, 100)
+        self.table.setColumnWidth(2, 100)
+        if self._mode == "activity":
+            self.table.setColumnWidth(3, 120)
+        if self._mode == "queue":
+            self.table.setColumnWidth(len(cols) - 1, 100)
         self.table.setRowCount(0)
+        self._rendered_rows = rows
         for r in rows:
             row = self.table.rowCount()
             self.table.insertRow(row)
             for col, (key, _) in enumerate(cols):
+                if key == "_link":
+                    btn = QPushButton("🔍 ดูคิว")
+                    btn.setStyleSheet(
+                        "QPushButton{background:transparent;color:#2563eb;"
+                        "border:none;font-size:11px;text-decoration:underline;cursor:pointer;}")
+                    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    btn.clicked.connect(lambda _, ridx=row: self._show_queue_detail(ridx))
+                    self.table.setCellWidget(row, col, btn)
+                    continue
                 v = r.get(key, "")
                 if key == "time" and v:
                     v = v.replace("T", " ")
@@ -7373,41 +7571,240 @@ class LogTab(QWidget):
         self.lbl_count.setText(f"ทั้งหมด {len(rows)} รายการ")
         self._cols = cols
 
-    def _export(self):
-        rows = activity_log.search(self._rows, self.search_box.text())
-        if not rows:
+    def _show_queue_detail(self, row_idx):
+        """แสดงรายละเอียดของคิวที่เลือก"""
+        if row_idx >= len(self._rendered_rows):
             return
-        name = ("activity_log" if self._mode == "activity" else "queue_log")
-        path, _ = QFileDialog.getSaveFileName(self, "Export Log",
-            f"KCash_{name}_{date.today().strftime('%Y%m%d')}.csv", "CSV (*.csv)")
-        if not path:
-            return
-        activity_log.export_csv(rows, path, self._cols)
-        QMessageBox.information(self, "✅ สำเร็จ", f"บันทึก Log แล้ว:\n{path}")
+        r = self._rendered_rows[row_idx]
+        items = r.get("items", [])
+        if isinstance(items, str):
+            try:
+                items = json.loads(items)
+            except Exception:
+                items = []
 
-    def _export_pdf(self):
-        rows = activity_log.search(self._rows, self.search_box.text())
+        dlg = QDialog(self)
+        dlg.setWindowTitle("🔍 รายละเอียดคิว")
+        dlg.setMinimumWidth(700)
+        dlg.setMinimumHeight(400)
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(16, 14, 16, 12)
+
+        head = QLabel(f"📋 {r.get('detail', '')}".strip())
+        head.setStyleSheet("font-size:14px;font-weight:700;color:#1e293b;")
+        head.setWordWrap(True)
+        v.addWidget(head)
+
+        info = QLabel(f"👤 {r.get('user', '')}  •  🕐 {r.get('time', '').replace('T', ' ')}  •  บริษัท: {r.get('company', '-')}")
+        info.setStyleSheet("font-size:12px;color:#475569;")
+        v.addWidget(info)
+
+        if items:
+            tbl = QTableWidget(0, 4)
+            tbl.setHorizontalHeaderLabels(["เลขเอกสาร", "ผู้รับเงิน", "ยอด (บาท)", "วันที่"])
+            tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            tbl.setColumnWidth(0, 140)
+            tbl.setColumnWidth(2, 110)
+            tbl.setColumnWidth(3, 80)
+            tbl.verticalHeader().setVisible(False)
+            tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            tbl.setStyleSheet(
+                "QTableWidget{border:1px solid #cbd5e1;font-size:12px;color:#1e293b;}"
+                "QHeaderView::section{background:#f1f5f9;color:#334155;font-weight:600;"
+                "border:1px solid #cbd5e1;padding:4px;}")
+            total = 0.0
+            for it in items:
+                rr = tbl.rowCount()
+                tbl.insertRow(rr)
+                doc = it.get("doc", "")
+                vendor = it.get("vendor", "")
+                amt = it.get("amount", 0)
+                day = str(it.get("day", ""))
+                try:
+                    total += float(amt)
+                except Exception:
+                    pass
+                tbl.setItem(rr, 0, QTableWidgetItem(doc))
+                tbl.setItem(rr, 1, QTableWidgetItem(vendor))
+                amt_item = QTableWidgetItem(fmt_amount(float(amt)) if amt else "")
+                amt_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                tbl.setItem(rr, 2, amt_item)
+                tbl.setItem(rr, 3, QTableWidgetItem(f"วัน {day}" if day else ""))
+            v.addWidget(tbl, 1)
+
+            lbl_total = QLabel(f"รวม {len(items)} รายการ • {fmt_amount(total)} บาท")
+            lbl_total.setStyleSheet("font-size:12px;font-weight:600;color:#16a34a;")
+            v.addWidget(lbl_total)
+        else:
+            v.addWidget(QLabel("ไม่มีรายละเอียดรายการ"))
+
+        b_close = QPushButton("ปิด")
+        b_close.setStyleSheet("QPushButton{padding:6px 18px;border:1px solid #cbd5e1;"
+                              "border-radius:5px;background:white;color:#334155;}")
+        b_close.clicked.connect(dlg.accept)
+        row_btn = QHBoxLayout()
+        row_btn.addStretch()
+        row_btn.addWidget(b_close)
+        v.addLayout(row_btn)
+        dlg.exec()
+
+    def _download_pdf(self, mode):
+        if mode == "activity":
+            old_mode = self._mode
+            self._mode = "activity"
+            self.reload()
+            rows = activity_log.search(self._rows, "")
+            title = "Activity Log (ใครทำอะไรเมื่อไหร่)"
+            name = "activity_log"
+            self._mode = old_mode
+        else:
+            old_mode = self._mode
+            self._mode = "queue"
+            self.reload()
+            rows = activity_log.search(self._rows, "")
+            title = "Log การจัดคิวจ่ายเงิน"
+            name = "queue_log"
+            self._mode = old_mode
+
         if not rows:
-            QMessageBox.information(self, "ไม่มีข้อมูล", "ไม่มี Log ให้บันทึก")
+            QMessageBox.information(self, "ไม่มีข้อมูล", "ไม่มี Log ในช่วงเวลาที่เลือก")
             return
-        title = ("Activity Log (ใครทำอะไรเมื่อไหร่)" if self._mode == "activity"
-                 else "Log การจัดคิวจ่ายเงิน")
-        name = ("activity_log" if self._mode == "activity" else "queue_log")
-        path, _ = QFileDialog.getSaveFileName(self, "บันทึก Log เป็น PDF",
-            f"KCash_{name}_{date.today().strftime('%Y%m%d')}.pdf", "PDF (*.pdf)")
+        d1, d2 = self._date_range()
+        title += f" ({d1} ถึง {d2})"
+        path, _ = QFileDialog.getSaveFileName(self, "ดาวน์โหลด Log เป็น PDF",
+            f"KCash_{name}_{d1}_{d2}.pdf", "PDF (*.pdf)")
         if not path:
             return
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
         try:
+            cols = self._cols
             from utils import build_log_pdf
-            build_log_pdf(rows, self._cols, title, path)
+            build_log_pdf(rows, cols, title, path)
         except Exception as e:
             QMessageBox.critical(self, "❌ ผิดพลาด", f"บันทึก PDF ไม่สำเร็จ:\n{e}")
             return
-        activity_log.log("บันทึก Log PDF", f"{title} • {len(rows)} รายการ")
+        activity_log.log("ดาวน์โหลด Log PDF", f"{title} • {len(rows)} รายการ")
         QMessageBox.information(self, "✅ สำเร็จ",
-            f"บันทึก Log เป็น PDF แล้ว (แก้ไขไม่ได้):\n{path}")
+            f"ดาวน์โหลด Log เป็น PDF แล้ว:\n{path}")
+        self._switch(old_mode)
+
+    def _cloud_setup(self):
+        """ตั้งค่า Cloud Audit Log — Supabase"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("⚙️ ตั้งค่า Cloud Audit Log")
+        dlg.setMinimumWidth(560)
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(18, 16, 18, 14)
+        v.setSpacing(10)
+
+        head = QLabel("☁️ ตั้งค่า Cloud Audit Log (Supabase)")
+        head.setStyleSheet("font-size:15px;font-weight:700;color:#1d4ed8;")
+        v.addWidget(head)
+
+        cfg = config.load_config()
+
+        v.addWidget(QLabel("Supabase URL:"))
+        ed_url = QLineEdit(cfg.get("supabase_url", ""))
+        ed_url.setPlaceholderText("https://xxxxx.supabase.co")
+        v.addWidget(ed_url)
+
+        v.addWidget(QLabel("Supabase API Key (anon/public):"))
+        ed_key = QLineEdit(cfg.get("supabase_key", ""))
+        ed_key.setPlaceholderText("eyJhbGciOiJIUzI1NiIs...")
+        ed_key.setEchoMode(QLineEdit.EchoMode.Password)
+        v.addWidget(ed_key)
+
+        info = QLabel(
+            "<div style='font-size:11px;color:#64748b;line-height:1.5'>"
+            "1. สมัคร <b>supabase.com</b> ฟรี → สร้าง Project<br>"
+            "2. ไปที่ SQL Editor → รัน SQL สร้างตาราง (ดูคู่มือ)<br>"
+            "3. คัดลอก <b>Project URL</b> และ <b>anon key</b> จาก Settings → API<br>"
+            "4. วางข้างบน แล้วกด <b>ทดสอบ</b> → <b>บันทึก</b>"
+            "</div>")
+        info.setTextFormat(Qt.TextFormat.RichText)
+        info.setWordWrap(True)
+        v.addWidget(info)
+
+        brow = QHBoxLayout()
+        b_test = QPushButton("🔌 ทดสอบเชื่อมต่อ")
+        b_test.setStyleSheet("QPushButton{padding:6px 14px;border:none;border-radius:5px;"
+                             "background:#2563eb;color:white;font-weight:600;}")
+        b_migrate = QPushButton("📤 Upload Log เดิมขึ้น Cloud")
+        b_migrate.setStyleSheet("QPushButton{padding:6px 14px;border:none;border-radius:5px;"
+                                "background:#7c3aed;color:white;font-weight:600;}")
+        brow.addWidget(b_test)
+        brow.addWidget(b_migrate)
+        brow.addStretch()
+        v.addLayout(brow)
+
+        result_lbl = QLabel("")
+        result_lbl.setStyleSheet("font-size:11px;color:#64748b;")
+        result_lbl.setWordWrap(True)
+        v.addWidget(result_lbl)
+
+        def _test_cfg():
+            return {"supabase_url": ed_url.text().strip(),
+                    "supabase_key": ed_key.text().strip()}
+
+        def _do_test():
+            try:
+                import cloud_log
+                result_lbl.setText("กำลังทดสอบ...")
+                QApplication.processEvents()
+                ok, msg = cloud_log.test_connection(_test_cfg())
+                result_lbl.setText(f"{'✅' if ok else '❌'} {msg}")
+            except Exception as e:
+                result_lbl.setText(f"❌ {e}")
+
+        def _do_migrate():
+            tc = _test_cfg()
+            if not tc.get("supabase_url"):
+                result_lbl.setText("❌ กรอก URL ก่อน")
+                return
+            try:
+                import cloud_log
+                result_lbl.setText("กำลัง upload log เดิม...")
+                QApplication.processEvents()
+                a_rows = activity_log.load_activity(); a_rows.reverse()
+                q_rows = activity_log.load_queue_log(); q_rows.reverse()
+                res = cloud_log.migrate_local_logs(tc, a_rows, q_rows)
+                if res["ok"]:
+                    result_lbl.setText(
+                        f"✅ Upload สำเร็จ — Activity: {res['activity']}, "
+                        f"Queue: {res['queue']} รายการ")
+                else:
+                    result_lbl.setText(f"❌ {res.get('error', '')}")
+            except Exception as e:
+                result_lbl.setText(f"❌ {e}")
+
+        b_test.clicked.connect(_do_test)
+        b_migrate.clicked.connect(_do_migrate)
+
+        btn_row = QHBoxLayout()
+        b_save = QPushButton("💾 บันทึก")
+        b_save.setStyleSheet("QPushButton{padding:6px 18px;border:none;border-radius:5px;"
+                             "background:#16a34a;color:white;font-weight:600;}")
+        b_close = QPushButton("ปิด")
+        b_close.setStyleSheet("QPushButton{padding:6px 18px;border:1px solid #cbd5e1;"
+                              "border-radius:5px;background:white;}")
+        btn_row.addStretch()
+        btn_row.addWidget(b_save)
+        btn_row.addWidget(b_close)
+        v.addLayout(btn_row)
+
+        def _do_save():
+            c = config.load_config()
+            c["supabase_url"] = ed_url.text().strip()
+            c["supabase_key"] = ed_key.text().strip()
+            config.save_config(c)
+            activity_log.reload_cloud_cfg()
+            result_lbl.setText("✅ บันทึกแล้ว")
+            activity_log.log("ตั้งค่า Cloud Audit Log", "Supabase")
+
+        b_save.clicked.connect(_do_save)
+        b_close.clicked.connect(dlg.accept)
+        dlg.exec()
 
 
 # ──────────────────── Login + User Management (ข้อ 8) ────────────────────
@@ -8326,7 +8723,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.1"
+APP_VERSION = "4.2"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8996,7 +9393,7 @@ class MainWindow(QMainWindow):
         self.queue_tab = QueueTab()
         self.stmt_tab  = StatementTab()
         self.slip_tab  = SlipMatchTab()
-        self.log_tab   = LogTab()
+        self.log_tab   = LogTab(current_user=self.current_user)
 
         self.tabs.addTab(self.queue_tab, "📋  คิวจ่ายเงิน")
         self.tabs.addTab(self.stmt_tab,  "🏦  Statement Matching")
@@ -9517,6 +9914,20 @@ def main():
         user = login.user   # {username, fullname, nickname, role}
         activity_log.set_session_user(user.get("nickname") or user.get("username"))
         activity_log.log("เข้าสู่ระบบ", f"{user.get('fullname','')} ({user.get('role','')})")
+
+        # Cloud Audit Log — auto migrate ครั้งแรก (background)
+        try:
+            import cloud_log
+            cfg_m = config.load_config()
+            if cloud_log.is_configured(cfg_m) and cloud_log.needs_migration():
+                import threading
+                def _bg_migrate():
+                    a = activity_log.load_activity(); a.reverse()
+                    q = activity_log.load_queue_log(); q.reverse()
+                    cloud_log.migrate_local_logs(cfg_m, a, q)
+                threading.Thread(target=_bg_migrate, daemon=True).start()
+        except Exception:
+            pass
 
         win = MainWindow(current_user=user)
         win.show()

@@ -1,6 +1,7 @@
 """
 Activity Log — เก็บประวัติว่าใครทำอะไรเมื่อไหร่ (สำหรับ requirement ข้อ 2, 8)
 เก็บข้าง config (พกพา): kcash_activity_log.json และ kcash_queue_log.json
++ sync ขึ้น Google Sheets (cloud_log) อัตโนมัติ
 
 โครงสร้าง 1 รายการ:
 {
@@ -15,9 +16,30 @@ import os
 import json
 import getpass
 from datetime import datetime
-from config import CONFIG_FILE
+from config import CONFIG_FILE, load_config
 
 _MAX = 5000   # เก็บไม่เกินกี่รายการ (กันไฟล์โต)
+
+
+_cloud_cfg_cache = None
+
+def _cloud_cfg() -> dict:
+    global _cloud_cfg_cache
+    if _cloud_cfg_cache is None:
+        try:
+            c = load_config()
+            _cloud_cfg_cache = {
+                "supabase_url": c.get("supabase_url", ""),
+                "supabase_key": c.get("supabase_key", ""),
+            }
+        except Exception:
+            _cloud_cfg_cache = {}
+    return _cloud_cfg_cache
+
+
+def reload_cloud_cfg():
+    global _cloud_cfg_cache
+    _cloud_cfg_cache = None
 
 
 def _path(name: str) -> str:
@@ -64,15 +86,23 @@ def _save(fname: str, rows: list) -> None:
 
 # ── Activity Log (ใครทำอะไรเมื่อไหร่) ──
 def log(action: str, detail: str = "", company: str = "") -> None:
+    user = current_user()
     rows = _load("kcash_activity_log.json")
     rows.append({
         "time":    datetime.now().isoformat(timespec="seconds"),
-        "user":    current_user(),
+        "user":    user,
         "action":  action,
         "detail":  detail,
         "company": company,
     })
     _save("kcash_activity_log.json", rows)
+    cc = _cloud_cfg()
+    if cc.get("supabase_url"):
+        try:
+            import cloud_log
+            cloud_log.append_activity_async(cc, user, action, detail, company)
+        except Exception:
+            pass
 
 
 def load_activity() -> list:
@@ -81,16 +111,24 @@ def load_activity() -> list:
 
 # ── Queue Log (ประวัติการจัดคิว — ข้อ 5/8) ──
 def log_queue(detail: str, items: list = None, company: str = "") -> None:
+    user = current_user()
     rows = _load("kcash_queue_log.json")
     rows.append({
         "time":    datetime.now().isoformat(timespec="seconds"),
-        "user":    current_user(),
+        "user":    user,
         "detail":  detail,
         "company": company,
         "count":   len(items) if items else 0,
         "items":   items or [],   # [{doc, vendor, amount, day}]
     })
     _save("kcash_queue_log.json", rows)
+    cc = _cloud_cfg()
+    if cc.get("supabase_url"):
+        try:
+            import cloud_log
+            cloud_log.append_queue_async(cc, user, detail, items, company)
+        except Exception:
+            pass
 
 
 def load_queue_log() -> list:
