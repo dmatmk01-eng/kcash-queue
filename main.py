@@ -2877,7 +2877,7 @@ class QueueTab(QWidget):
     status_message = pyqtSignal(str)
     company_changed = pyqtSignal()   # แจ้งเมื่อสลับบริษัท
 
-    COLS = ["", "เลขที่เอกสาร", "ผู้รับเงิน / Vendor", "แบรนด์", "ครบกำหนด", "วันที่จ่าย", "ยอดเงิน (บาท)", "สถานะ", "Statement Match", "หมายเหตุ (พิมพ์ได้)", "ลิงก์แชร์ / ลิงก์แก้ไข", "แนบไฟล์เข้า FlowAccount", "🗑️ ลบ"]
+    COLS = ["", "เลขที่เอกสาร", "ผู้รับเงิน / Vendor", "แบรนด์", "ครบกำหนด", "วันที่จ่าย", "ยอดเงิน (บาท)", "สถานะ", "Statement Match", "เลขที่วางบิล", "หมายเหตุ (พิมพ์ได้)", "ลิงก์แชร์ / ลิงก์แก้ไข", "แนบไฟล์เข้า FlowAccount", "🗑️ ลบ"]
     # ตัวเลือกสถานะที่กดเปลี่ยนได้จากเซลล์ (✅ จ่ายแล้ว = บันทึกเข้า FlowAccount จริง)
     STATUS_OPTS = ["🟡 รอจ่าย", "🔵 อนุมัติแล้ว", "🟣 จ่ายแล้วรออัพเดต",
                    "🚫 ไม่อนุมัติ", "✅ จ่ายแล้ว"]
@@ -3161,10 +3161,11 @@ class QueueTab(QWidget):
         self.table.setColumnWidth(6, 120)   # ยอดเงิน
         self.table.setColumnWidth(7, 150)   # สถานะ
         self.table.setColumnWidth(8, 170)   # match
-        self.table.setColumnWidth(9, 200)   # หมายเหตุ (พิมพ์ได้)
-        self.table.setColumnWidth(10, 190)  # ลิงก์แชร์ / ลิงก์แก้ไข
-        self.table.setColumnWidth(11, 70)   # แนบไฟล์
-        self.table.setColumnWidth(12, 60)   # ลบ
+        self.table.setColumnWidth(9, 130)   # เลขที่วางบิล
+        self.table.setColumnWidth(10, 200)  # หมายเหตุ (พิมพ์ได้)
+        self.table.setColumnWidth(11, 190)  # ลิงก์แชร์ / ลิงก์แก้ไข
+        self.table.setColumnWidth(12, 70)   # แนบไฟล์
+        self.table.setColumnWidth(13, 60)   # ลบ
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         # อนุญาตแก้ไขเฉพาะช่องที่ตั้ง ItemIsEditable (คอลัมน์หมายเหตุ) — ช่องอื่นแก้ไม่ได้
@@ -3696,13 +3697,17 @@ class QueueTab(QWidget):
             return _amount(e)
         if col == 7:   # สถานะ
             return self._status_category(e)
-        if col == 9:   # หมายเหตุ
+        if col == 9:   # เลขที่วางบิล
+            fa_rm = e.get("remarks") or ""
+            m = re.search(r"#sbl-\s*(\S+)", fa_rm, re.IGNORECASE)
+            return m.group(1).lower() if m else ""
+        if col == 10:   # หมายเหตุ
             return (remarks.get(_exp_id(e)) or "").lower()
         return _doc_no(e).lower()
 
     def _sort_by_column(self, col):
         """คลิกหัวคอลัมน์ → เรียงตามคอลัมน์นั้น (สลับ น้อย→มาก / มาก→น้อย)"""
-        if col in (0, 8, 10, 11, 12):   # ช่องติ๊ก/match/ลิงก์/แนบ/ลบ — ไม่เรียง
+        if col in (0, 8, 11, 12, 13):   # ช่องติ๊ก/match/ลิงก์/แนบ/ลบ — ไม่เรียง
             return
         if self._sort_key_col == col:
             self._sort_asc = not self._sort_asc
@@ -4015,16 +4020,25 @@ class QueueTab(QWidget):
                 match_text = "—"
             self.table.setItem(row, 8, cell(match_text))
 
-            # col 9: หมายเหตุ — พิมพ์ได้ บันทึกอัตโนมัติ
+            # col 9: เลขที่วางบิล — จาก remarks ของ FlowAccount (#sbl-XXXX หรือข้อความทั้งหมด)
+            fa_remarks = (exp.get("remarks") or "").strip()
+            _sbl_match = re.search(r"#sbl-\s*(.+)", fa_remarks, re.IGNORECASE)
+            sbl_text = _sbl_match.group(1).strip() if _sbl_match else fa_remarks
+            sbl_item = cell(sbl_text)
+            if sbl_text:
+                sbl_item.setToolTip(fa_remarks)
+            self.table.setItem(row, 9, sbl_item)
+
+            # col 10: หมายเหตุ — พิมพ์ได้ บันทึกอัตโนมัติ
             rm_item = QTableWidgetItem(remarks.get(eid))
             rm_item.setFlags(rm_item.flags() | Qt.ItemFlag.ItemIsEditable)
             rm_item.setData(Qt.ItemDataRole.UserRole, eid)
             rm_item.setToolTip("ดับเบิลคลิกเพื่อพิมพ์หมายเหตุ")
             if bg:
                 rm_item.setBackground(QBrush(bg))
-            self.table.setItem(row, 9, rm_item)
+            self.table.setItem(row, 10, rm_item)
 
-            # col 10: ลิงก์แชร์ / ลิงก์แก้ไข — โชว์ทั้ง 2 ลิงก์ในช่องเดียว
+            # col 11: ลิงก์แชร์ / ลิงก์แก้ไข — โชว์ทั้ง 2 ลิงก์ในช่องเดียว
             url = share_links.get(eid)
             edit = "" if is_manual(exp) else _exp_edit_link(exp)
             parts = []
@@ -4040,17 +4054,17 @@ class QueueTab(QWidget):
                 lk.setOpenExternalLinks(True)
                 lk.setToolTip((url or "") + ("\n" + edit if edit else ""))
                 lk.setStyleSheet("font-size:12px;padding-left:6px;background:transparent;")
-                self.table.setCellWidget(row, 10, lk)
+                self.table.setCellWidget(row, 11, lk)
             else:
-                self.table.removeCellWidget(row, 10)
+                self.table.removeCellWidget(row, 11)
                 ph = QTableWidgetItem("—")
                 ph.setFlags(ph.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 ph.setForeground(QBrush(QColor("#94a3b8")))
                 if bg:
                     ph.setBackground(QBrush(bg))
-                self.table.setItem(row, 10, ph)
+                self.table.setItem(row, 11, ph)
 
-            # col 11: แนบไฟล์ — กดเพื่อแนบ/ดูไฟล์แนบใน FlowAccount
+            # col 12: แนบไฟล์ — กดเพื่อแนบ/ดูไฟล์แนบใน FlowAccount
             btn_a = QPushButton("📎")
             btn_a.setToolTip("แนบไฟล์ / ดูไฟล์แนบ")
             btn_a.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -4060,9 +4074,9 @@ class QueueTab(QWidget):
             aw = QWidget(); al = QHBoxLayout(aw)
             al.addWidget(btn_a); al.setAlignment(Qt.AlignmentFlag.AlignCenter)
             al.setContentsMargins(0, 0, 0, 0)
-            self.table.setCellWidget(row, 11, aw)
+            self.table.setCellWidget(row, 12, aw)
 
-            # col 12: ลบ — ลบจริงใน FlowAccount (คอลัมน์สีแดง)
+            # col 13: ลบ — ลบจริงใน FlowAccount (คอลัมน์สีแดง)
             _tip = {"expense": "ลบ EXP นี้ใน FlowAccount + คืนสถานะ PO เป็นอนุมัติ",
                     "po": "ลบใบสั่งซื้อ (PO) นี้ใน FlowAccount",
                     "gr": "ลบใบรับสินค้านี้ใน FlowAccount"}.get(dt, "ลบเอกสารนี้ใน FlowAccount")
@@ -4077,7 +4091,7 @@ class QueueTab(QWidget):
             dl.addWidget(btn_d); dl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             dl.setContentsMargins(0, 0, 0, 0)
             dw.setStyleSheet("background:#fee2e2;")
-            self.table.setCellWidget(row, 12, dw)
+            self.table.setCellWidget(row, 13, dw)
 
         self._loading = False
         self._update_buttons()
@@ -4474,7 +4488,7 @@ class QueueTab(QWidget):
 
     def _show_detail(self, row, col):
         """ดับเบิลคลิกแถว → ดูรายละเอียดรายการ (ข้อ 3)"""
-        if col in (1, 9, 10):    # เลขเอกสาร(คลิก=copy)/หมายเหตุ/ลิงก์แชร์ → ไม่เปิด popup
+        if col in (1, 10, 11):    # เลขเอกสาร(คลิก=copy)/หมายเหตุ/ลิงก์แชร์ → ไม่เปิด popup
             return
         rows = getattr(self, "_page_rows", [])
         if 0 <= row < len(rows):
@@ -4500,16 +4514,16 @@ class QueueTab(QWidget):
         AttachDialog(exp, self).exec()
 
     def _on_remark_changed(self, item):
-        """พิมพ์หมายเหตุ (คอลัมน์ 9) / วางลิงก์แชร์ (คอลัมน์ 10) → บันทึกอัตโนมัติ"""
+        """พิมพ์หมายเหตุ (คอลัมน์ 10) / วางลิงก์แชร์ (คอลัมน์ 11) → บันทึกอัตโนมัติ"""
         if getattr(self, "_loading", False):
             return
         eid = item.data(Qt.ItemDataRole.UserRole)
         if not eid:
             return
-        if item.column() == 9:
+        if item.column() == 10:
             remarks.set(eid, item.text())
             self.status_message.emit(f"💾 บันทึกหมายเหตุ {eid} แล้ว")
-        elif item.column() == 10:
+        elif item.column() == 11:
             share_links.set(eid, item.text())
             self.status_message.emit(f"🔗 บันทึกลิงก์แชร์ {eid} แล้ว")
 
@@ -8723,7 +8737,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.2.1"
+APP_VERSION = "4.2.2"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
