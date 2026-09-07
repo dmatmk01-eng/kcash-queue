@@ -46,7 +46,8 @@ from utils import (build_bank_csv, build_bank_excel, build_line_message,
                    parse_statement_csv, match_statements, fmt_date, fmt_amount, today_str,
                    distribute_into_days, build_bank_excel_multiday, build_bank_pdf_multiday,
                    build_bank_html_multiday, upload_html_temp, upload_html_github,
-                   delete_all_kcash_gists, assign_dates, _exp_edit_link)
+                   delete_all_kcash_gists, assign_dates, _exp_edit_link,
+                   _group_by_tier, _tier_summary)
 from manual_expenses import load_manual, add_manual, delete_manual, update_manual, is_manual
 from brand_assignments import load_assignments as load_brands, save_assignments as save_brands, get_brand, set_brand
 from bank_slip import parse_payment_report, match_slip_to_expenses, _exp_serial as _slip_exp_serial
@@ -57,6 +58,7 @@ import rejected
 import users
 import remarks
 import share_links
+import expense_tiers
 import config
 
 
@@ -234,7 +236,7 @@ def _payment_date(e: dict) -> str:
 def _share_link(e: dict) -> str:
     """สร้างลิงก์ไปหน้าเอกสารใน FlowAccount (ข้อมูลเพิ่มเติมของรายการ)"""
     sc  = e.get("_support_code") or ""
-    rid = e.get("recordId") or e.get("documentId") or ""
+    rid = e.get("documentId") or e.get("recordId") or ""
     if sc and rid:
         return f"https://advance.flowaccount.com/{sc}/business/expenses/{rid}"
     return ""
@@ -306,6 +308,19 @@ class ShareLinkWorker(QThread):
                 fail += 1
             self.progress.emit(i, total)
         self.finished_all.emit(ok, fail)
+
+
+class DocHistoryIndexWorker(QThread):
+    """โหลดประวัติการจัดคิวทั้งหมด (cloud/local) มาแจงเป็น {doc_no: [ครั้งที่เคยจัดคิว]}
+    ใช้แสดงคอลัมน์ 'เคยจัดคิว' — รันเบื้องหลัง ไม่บล็อก UI"""
+    done = pyqtSignal(dict)
+
+    def run(self):
+        try:
+            idx = activity_log.get_doc_history_index()
+        except Exception:
+            idx = {}
+        self.done.emit(idx)
 
 
 class FetchWorker(QThread):
@@ -748,6 +763,8 @@ class QueuePlanDialog(QDialog):
         self._marked_pending = []   # exp ที่กด Mark จ่ายแล้วรออัพเดต
         self._saved_at = ""
         self._day_dates_override = {}   # {index วัน: 'yyyy-mm-dd'} วันจ่ายที่ผู้ใช้กำหนดเอง
+        self._small_items = []     # ย่อย ≤10k (แยกอัตโนมัติ)
+        self._urgent_items = []    # ด่วน ≤20k (เลือกมือ)
 
         if preset_days is not None:
             # โหมดแก้ไขจากประวัติ — ใช้การจัดเรียง/วันที่ตามที่ส่งมา (ไม่โหลดแผนปัจจุบัน)
@@ -757,6 +774,12 @@ class QueuePlanDialog(QDialog):
                     i: str(iso)[:10] for i, iso in enumerate(preset_dates) if iso}
             self._saved_at = ""
         else:
+            # sync tier + credit vendors จาก cloud ก่อนจัดคิว
+            try:
+                expense_tiers.sync_from_cloud()
+                expense_tiers.sync_credit_vendors_from_cloud()
+            except Exception:
+                pass
             # โหลดการจัดเรียงที่บันทึกไว้ (ถ้ามี) ไม่งั้นกระจายอัตโนมัติ
             self._days = self._load_or_distribute(candidates)
 
@@ -884,6 +907,31 @@ class QueuePlanDialog(QDialog):
         tb_s.addSpacing(8)
         tb_s.addWidget(self.lbl_search)
         tb_s.addStretch()
+        # ปุ่มเอาออก — ส่งรายการย่อย/ด่วนกลับไปตารางของตัวเอง
+        self.btn_remove_tier = QPushButton("↩️ เอาออก (ส่งกลับ ย่อย/ด่วน)")
+        self.btn_remove_tier.setStyleSheet(
+            "QPushButton{padding:5px 12px;border:1px solid #f59e0b;border-radius:4px;"
+            "background:white;color:#b45309;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background:#fef3c7;}"
+            "QPushButton:disabled{color:#94a3b8;border-color:#cbd5e1;}")
+        self.btn_remove_tier.setToolTip("ติ๊กรายการย่อย/ด่วนที่อยู่ในคิว แล้วกดเพื่อส่งกลับไปตาราง ย่อย/ด่วน")
+        self.btn_remove_tier.clicked.connect(self._remove_tier_items)
+        tb_s.addWidget(self.btn_remove_tier)
+        # ปุ่มดูย่อย + ด่วน
+        self.btn_view_small = QPushButton("🔵 รายจ่ายย่อย (ไม่เกิน 1 หมื่น)")
+        self.btn_view_small.setStyleSheet(
+            "QPushButton{padding:5px 12px;border:1px solid #2563eb;border-radius:4px;"
+            "background:white;color:#2563eb;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background:#eff6ff;}")
+        self.btn_view_small.clicked.connect(self._view_small_items)
+        tb_s.addWidget(self.btn_view_small)
+        self.btn_view_urgent = QPushButton("🔴 รายจ่ายด่วน (วงเงินเพิ่ม 2 หมื่น/วัน)")
+        self.btn_view_urgent.setStyleSheet(
+            "QPushButton{padding:5px 12px;border:1px solid #dc2626;border-radius:4px;"
+            "background:white;color:#dc2626;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background:#fef2f2;}")
+        self.btn_view_urgent.clicked.connect(self._view_urgent_items)
+        tb_s.addWidget(self.btn_view_urgent)
         # ปุ่มรายการไม่อนุมัติ (ย้ายลงมาอยู่แถวนี้)
         self.btn_view_rejected = QPushButton("📋 รายการไม่อนุมัติ")
         self.btn_view_rejected.setStyleSheet(
@@ -896,15 +944,16 @@ class QueuePlanDialog(QDialog):
 
         # ── tree ──
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(7)
+        self.tree.setColumnCount(8)
         self.tree.setHeaderLabels(["รายการ / วันจ่าย", "เลขที่เอกสาร", "แบรนด์",
-                                   "ครบกำหนด", "จำนวนเงิน (บาท)", "หมายเหตุ", "ลิงก์แชร์"])
-        self.tree.setColumnWidth(0, 280)
+                                   "ครบกำหนด", "จำนวนเงิน (บาท)", "หมายเหตุ", "ลิงก์แชร์", "แก้ไขใบ"])
+        self.tree.setColumnWidth(0, 260)
         self.tree.setColumnWidth(1, 115)
-        self.tree.setColumnWidth(2, 100)
-        self.tree.setColumnWidth(3, 95)
-        self.tree.setColumnWidth(4, 115)
-        self.tree.setColumnWidth(5, 150)
+        self.tree.setColumnWidth(2, 90)
+        self.tree.setColumnWidth(3, 90)
+        self.tree.setColumnWidth(4, 110)
+        self.tree.setColumnWidth(5, 130)
+        self.tree.setColumnWidth(6, 80)
         self.tree.header().setStretchLastSection(True)
         self.tree.setAlternatingRowColors(True)
         self.tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -946,13 +995,69 @@ class QueuePlanDialog(QDialog):
             except Exception:
                 pass
 
+        self._auto_import_tiers()
+        # auto-save ให้ saved plan ตรงกับที่แสดง (export จะได้ตรงกัน)
+        self._persist_plan()
         self._render()
         self._update_buttons()
 
+    @staticmethod
+    def _is_person_name(vendor: str) -> bool:
+        """ตรวจว่าชื่อ vendor น่าจะเป็นชื่อคน (นาย/นาง/นางสาว/MR/MRS/MS หรือไม่มีคำว่า บริษัท/ห้าง/ร้าน)"""
+        v = (vendor or "").strip().lower()
+        if not v:
+            return False
+        person_prefixes = ("นาย", "นาง", "น.ส.", "นางสาว", "mr.", "mr ", "mrs.", "mrs ",
+                           "ms.", "ms ", "miss ", "คุณ")
+        for p in person_prefixes:
+            if v.startswith(p):
+                return True
+        company_words = ("บริษัท", "ห้างหุ้นส่วน", "ห้าง", "ร้าน", "shopee", "lazada",
+                         "jib", "company", "co.,", "ltd", "corp")
+        for w in company_words:
+            if w in v:
+                return False
+        return True
+
+    def _auto_import_tiers(self):
+        """นำรายการย่อย/ด่วนเข้าคิวอัตโนมัติ กระจายทุกวัน (ชื่อคนก่อน, ไม่เกินวงเงิน/วัน)"""
+        def _sort_persons_first(items):
+            persons = [e for e in items if self._is_person_name(_vendor(e))]
+            others = [e for e in items if not self._is_person_name(_vendor(e))]
+            return persons + others
+
+        def _spread(items, daily_limit, tag):
+            """กระจายรายการลงทุกวันใน self._days (ไม่เกิน daily_limit/วัน)"""
+            ordered = _sort_persons_first(items)
+            remaining = []
+            for e in ordered:
+                amt = _amount(e)
+                placed = False
+                for di, grp in enumerate(self._days):
+                    tier_total = sum(_amount(x) for x in grp if x.get("_tier_tag") == tag)
+                    if tier_total + amt <= daily_limit:
+                        e["_tier_tag"] = tag
+                        grp.append(e)
+                        placed = True
+                        break
+                if not placed:
+                    remaining.append(e)
+            return remaining
+
+        # ย่อย: กระจายทุกวัน ≤10k/วัน
+        if self._small_items:
+            self._small_items = _spread(self._small_items,
+                                        expense_tiers.SMALL_THRESHOLD, "รายการย่อย")
+
+        # ด่วน: กระจายทุกวัน ≤20k/วัน
+        if self._urgent_items:
+            self._urgent_items = _spread(self._urgent_items,
+                                         expense_tiers.URGENT_DAILY_LIMIT, "รายการด่วน")
+
     def _load_or_distribute(self, candidates):
-        """ถ้ามีการจัดเรียงที่บันทึกไว้ → ใช้อันนั้น (รายการใหม่ที่ยังไม่จัด ค่อยกระจายเพิ่ม)"""
+        """ถ้ามีการจัดเรียงที่บันทึกไว้ → ใช้อันนั้น (รายการใหม่ที่ยังไม่จัด ค่อยกระจายเพิ่ม)
+        แยก ย่อย/ด่วน ออกก่อนเสมอ"""
         saved = queue_plan.load_plan()
-        # พ้น 3 วันแล้ว → ดีดทิ้ง จัดใหม่ (ข้อ 10)
         if saved and saved.get("saved_at"):
             try:
                 age = (datetime.now()
@@ -962,24 +1067,46 @@ class QueuePlanDialog(QDialog):
                     saved = {}
             except Exception:
                 pass
-        if not (saved and saved.get("days")):
-            return self._distribute(candidates)
 
+        if not (saved and saved.get("days")):
+            # ไม่มี saved plan → แยก tier ก่อนแล้วจัดเฉพาะ normal
+            classified = expense_tiers.classify_expenses(candidates, amount_fn=_amount, vendor_fn=_vendor)
+            self._small_items = classified.get("small", [])
+            self._urgent_items = classified.get("urgent", [])
+            return self._distribute(classified.get("normal", []))
+
+        # มี saved plan → match ทุกรายการตาม saved plan (รวม tier items)
         by_id = {_exp_id(e): e for e in candidates}
+        saved_ids = {i for day_ids in saved["days"] for i in day_ids}
         used = set()
         days = []
+        newly_urgent = []
+        newly_small = []
         for day_ids in saved["days"]:
-            grp = [by_id[i] for i in day_ids if i in by_id and i not in used]
+            grp = []
             for i in day_ids:
+                if i in by_id and i not in used:
+                    e = by_id[i]
+                    amt = _amount(e)
+                    tier = expense_tiers.get_tier(i, amt, _vendor(e))
+                    if tier == expense_tiers.TIER_URGENT:
+                        newly_urgent.append(e)
+                    elif tier == expense_tiers.TIER_SMALL:
+                        newly_small.append(e)
+                    else:
+                        grp.append(e)
                 used.add(i)
             days.append(grp)
-        # รายการใหม่ที่ยังไม่เคยจัด → กระจายเพิ่มต่อท้าย
-        leftover = [e for e in candidates if _exp_id(e) not in used]
-        if leftover:
-            days.extend(self._distribute(leftover))
+        # รายการใหม่ที่ไม่อยู่ใน saved plan → แยก tier แล้วจัดต่อท้าย
+        leftover = [e for e in candidates if _exp_id(e) not in saved_ids]
+        classified = expense_tiers.classify_expenses(leftover, amount_fn=_amount, vendor_fn=_vendor)
+        self._small_items = classified.get("small", []) + newly_small
+        self._urgent_items = classified.get("urgent", []) + newly_urgent
+        new_normal = classified.get("normal", [])
+        if new_normal:
+            days.extend(self._distribute(new_normal))
         days = [g for g in days if g] or [[]]
         self._saved_at = saved.get("saved_at", "")
-        # โหลดวันจ่ายที่ผู้ใช้กำหนดเอง (ถ้าเคยบันทึกไว้)
         saved_dates = saved.get("dates") or []
         self._day_dates_override = {
             i: iso for i, iso in enumerate(saved_dates) if iso}
@@ -987,16 +1114,13 @@ class QueuePlanDialog(QDialog):
 
     # ── การกระจายรายการ ──
     def _distribute(self, candidates):
-        """
-        เรียงตามความสำคัญ แล้วบรรจุลงแต่ละวันแบบ best-fit
-        (ข้ามรายการที่ใส่ไม่พอ ลองตัวถัดไปให้เต็มวงเงินที่สุด)
-        — ใช้ตรรกะเดียวกับปุ่ม 🤖 จัดคิวอัตโนมัติ เพื่อให้ยอดวันที่ 1 ตรงกัน
-        """
+        """กระจายรายการลงวัน ๆ ตาม best-fit วงเงิน/วัน
+        แยก ย่อย/ด่วน เก็บไว้ แล้วจัดเฉพาะ normal"""
         today_iso = date.today().isoformat()
 
         def priority(e):
             if _is_vip_vendor(e):
-                return (-1, "")     # นายพชร รัชนาทสกุล → จัดคิวก่อนเสมอ
+                return (-1, "")
             due = (_due(e) or "")[:10]
             if due and due < today_iso:
                 return (0, due)
@@ -1005,20 +1129,32 @@ class QueuePlanDialog(QDialog):
             else:
                 return (2, "9999-12-31")
 
-        remaining = sorted(candidates, key=priority)
+        classified = expense_tiers.classify_expenses(candidates, amount_fn=_amount, vendor_fn=_vendor)
 
+        normal = sorted(classified.get("normal", []), key=priority)
+        # เก็บ small/urgent (ถ้ายังไม่มี)
+        new_small = sorted(classified.get("small", []), key=priority)
+        new_urgent = sorted(classified.get("urgent", []), key=priority)
+        if new_small:
+            self._small_items = (self._small_items or []) + new_small
+        if new_urgent:
+            self._urgent_items = (self._urgent_items or []) + new_urgent
+
+        # ปกติ — best-fit วงเงิน/วัน
         days = []
+        remaining = list(normal)
         while remaining:
             day, total, rest = [], 0.0, []
             for e in remaining:
                 amt = _amount(e)
                 if self._limit > 0 and day and (total + amt) > self._limit:
-                    rest.append(e)   # ใส่ไม่พอ → เก็บไว้วันถัดไป ลองตัวเล็กกว่าต่อ
+                    rest.append(e)
                     continue
                 day.append(e)
                 total += amt
             days.append(day)
             remaining = rest
+
         return days or [[]]
 
     @staticmethod
@@ -1062,73 +1198,151 @@ class QueuePlanDialog(QDialog):
             day_total = sum(_amount(e) for e in grp)
             grand += day_total
             over = self._limit > 0 and day_total > self._limit
+            tier_info = _tier_summary(grp)
+
             label = (f"📅 วันที่ {di + 1}  ({thai_days[d.weekday()]} {fmt_date(d.isoformat())})"
                      f"  —  {len(grp)} รายการ")
-            top = QTreeWidgetItem([label, "", "", "", fmt_amount(day_total), "", ""])
+            if tier_info:
+                label += f"  ({tier_info})"
+            top = QTreeWidgetItem([label, "", "", "", fmt_amount(day_total), "", "", ""])
             top.setData(0, Qt.ItemDataRole.UserRole, ("day", di))
-            # เช็คบ็อกซ์หัววัน — ติ๊ก=เลือกทั้งวัน / ปลด=เอาเครื่องหมายออกทั้งวัน
             top.setFlags(top.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             top.setCheckState(0, Qt.CheckState.Unchecked)
             f = top.font(0); f.setBold(True); top.setFont(0, f); top.setFont(4, f)
             bg = QColor("#fee2e2") if over else QColor("#dcfce7")
-            for c in range(7):
+            for c in range(8):
                 top.setBackground(c, QBrush(bg))
-            top.setForeground(0, QBrush(QColor("#991b1b" if over else "#15803d")))
-            top.setForeground(4, QBrush(QColor("#991b1b" if over else "#15803d")))
+            top.setForeground(0, QBrush(QColor("#991b1b") if over else QColor("#15803d")))
+            top.setForeground(4, QBrush(QColor("#991b1b") if over else QColor("#15803d")))
             top.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             if over:
                 top.setToolTip(0, "ยอดวันนี้เกินวงเงิน — ลองย้ายบางรายการไปวันอื่น")
             self.tree.addTopLevelItem(top)
 
-            for e in grp:
-                vendor = _vendor(e) or "—"
-                doc = _doc_no(e)
-                brand = _brand_name(e, self._assignments) or "—"
-                due = fmt_date(_due(e)) if _due(e) else "—"
-                eid = _exp_id(e)
-                child = QTreeWidgetItem([vendor, doc, brand, due,
-                                         fmt_amount(_amount(e)), remarks.get(eid), ""])
-                child.setData(0, Qt.ItemDataRole.UserRole, ("exp", eid))
-                child.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                # ☑️ checkbox หน้าแต่ละรายการ (selector) + หมายเหตุ(col5) แก้ไขได้
-                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable
-                               | Qt.ItemFlag.ItemIsEditable)
-                child.setCheckState(0, Qt.CheckState.Checked
-                                    if eid in keep_checked
-                                    else Qt.CheckState.Unchecked)
-                child.setToolTip(5, "ดับเบิลคลิกช่องนี้เพื่อพิมพ์หมายเหตุ")
-                # เน้นสีรายการเกินกำหนด
-                if _due(e) and (_due(e) or "")[:10] < date.today().isoformat():
-                    child.setForeground(0, QBrush(QColor("#dc2626")))
-                top.addChild(child)
-                # ลิงก์แชร์ (col 6) — มีลิงก์แล้วโชว์ลิงก์ / ยังไม่มี = ปุ่มกดดึง+เปิด
-                url = share_links.get(eid)
-                if url:
-                    lk = QLabel(f"🔗 <a href='{url}'>เปิดดู</a>")
-                    lk.setTextFormat(Qt.TextFormat.RichText)
-                    lk.setOpenExternalLinks(True)
-                    lk.setStyleSheet("font-size:12px;padding-left:4px;background:transparent;")
-                    self.tree.setItemWidget(child, 6, lk)
+            # จัดกลุ่มรายการตาม tier (ปกติ → ย่อย → ด่วน)
+            t_normal, t_small, t_urgent = _group_by_tier(grp)
+            has_multiple_tiers = sum(1 for g in (t_normal, t_small, t_urgent) if g) > 1
+            tier_groups = []
+            if t_normal:
+                if has_multiple_tiers:
+                    n_total = sum(_amount(e) for e in t_normal)
+                    tier_groups.append(("🟢 รายการปกติ", t_normal,
+                        f"🟢 รายการปกติ — {len(t_normal)} รายการ • {fmt_amount(n_total)} บาท"))
                 else:
-                    b = QPushButton("🔗 ดูใบ")
-                    b.setCursor(Qt.CursorShape.PointingHandCursor)
-                    b.setStyleSheet(
-                        "QPushButton{padding:1px 6px;border:1px solid #2563eb;border-radius:4px;"
-                        "background:white;color:#2563eb;font-size:11px;}"
-                        "QPushButton:hover{background:#dbeafe;}")
-                    b.clicked.connect(lambda _=False, ex=e: self._open_share_doc(ex))
-                    bw = QWidget(); bl = QHBoxLayout(bw)
-                    bl.addWidget(b); bl.setContentsMargins(2, 0, 2, 0)
-                    bl.setAlignment(Qt.AlignmentFlag.AlignLeft)
-                    self.tree.setItemWidget(child, 6, bw)
-                if keep and eid == keep:
-                    target_item = child
+                    tier_groups.append(("", t_normal, None))
+            if t_small:
+                s_total = sum(_amount(e) for e in t_small)
+                tier_groups.append(("🔵 รายการย่อย", t_small,
+                    f"🔵 รายการย่อย — {len(t_small)} รายการ • {fmt_amount(s_total)} บาท"))
+            if t_urgent:
+                u_total = sum(_amount(e) for e in t_urgent)
+                tier_groups.append(("🔴 รายการด่วน", t_urgent,
+                    f"🔴 รายการด่วน — {len(t_urgent)} รายการ • {fmt_amount(u_total)} บาท"))
+
+            for tier_label, tier_items, sub_header in tier_groups:
+                if sub_header:
+                    sep = QTreeWidgetItem([sub_header, "", "", "", "", "", "", ""])
+                    sep.setFlags(sep.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+                    sf = sep.font(0); sf.setBold(True); sf.setItalic(True); sep.setFont(0, sf)
+                    if "ด่วน" in sub_header:
+                        for c in range(8):
+                            sep.setBackground(c, QBrush(QColor("#fee2e2")))
+                        sep.setForeground(0, QBrush(QColor("#dc2626")))
+                    elif "ย่อย" in sub_header:
+                        for c in range(8):
+                            sep.setBackground(c, QBrush(QColor("#dbeafe")))
+                        sep.setForeground(0, QBrush(QColor("#1d4ed8")))
+                    else:
+                        for c in range(8):
+                            sep.setBackground(c, QBrush(QColor("#dcfce7")))
+                        sep.setForeground(0, QBrush(QColor("#15803d")))
+                    top.addChild(sep)
+
+                for e in tier_items:
+                    vendor = _vendor(e) or "—"
+                    doc = _doc_no(e)
+                    brand = _brand_name(e, self._assignments) or "—"
+                    due = fmt_date(_due(e)) if _due(e) else "—"
+                    eid = _exp_id(e)
+                    amt = _amount(e)
+                    _tag = e.get("_tier_tag", "")
+                    badge_prefix = ""
+                    if _tag == "รายการย่อย":
+                        badge_prefix = "🔵 "
+                    elif _tag == "รายการด่วน":
+                        badge_prefix = "🔴 "
+                    child = QTreeWidgetItem([badge_prefix + vendor, doc, brand, due,
+                                             fmt_amount(amt), remarks.get(eid), "", ""])
+                    child.setData(0, Qt.ItemDataRole.UserRole, ("exp", eid))
+                    child.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                                   | Qt.ItemFlag.ItemIsEditable)
+                    child.setCheckState(0, Qt.CheckState.Checked
+                                        if eid in keep_checked
+                                        else Qt.CheckState.Unchecked)
+                    if _tag:
+                        child.setToolTip(0, f"[{_tag}] — ติ๊กแล้วกดปุ่ม 'เอาออก' เพื่อส่งกลับ")
+                    child.setToolTip(5, "ดับเบิลคลิกช่องนี้เพื่อพิมพ์หมายเหตุ")
+                    if _due(e) and (_due(e) or "")[:10] < date.today().isoformat():
+                        child.setForeground(0, QBrush(QColor("#dc2626")))
+                    elif _tag == "รายการย่อย":
+                        child.setForeground(0, QBrush(QColor("#2563eb")))
+                    elif _tag == "รายการด่วน":
+                        child.setForeground(0, QBrush(QColor("#dc2626")))
+                    top.addChild(child)
+                    url = share_links.get(eid)
+                    if url:
+                        lk = QLabel(f"🔗 <a href='{url}'>เปิดดู</a>")
+                        lk.setTextFormat(Qt.TextFormat.RichText)
+                        lk.setOpenExternalLinks(True)
+                        lk.setStyleSheet("font-size:12px;padding-left:4px;background:transparent;")
+                        self.tree.setItemWidget(child, 6, lk)
+                    else:
+                        b = QPushButton("🔗 ดูใบ")
+                        b.setCursor(Qt.CursorShape.PointingHandCursor)
+                        b.setStyleSheet(
+                            "QPushButton{padding:1px 6px;border:1px solid #2563eb;border-radius:4px;"
+                            "background:white;color:#2563eb;font-size:11px;}"
+                            "QPushButton:hover{background:#dbeafe;}")
+                        b.clicked.connect(lambda _=False, ex=e: self._open_share_doc(ex))
+                        bw = QWidget(); bl = QHBoxLayout(bw)
+                        bl.addWidget(b); bl.setContentsMargins(2, 0, 2, 0)
+                        bl.setAlignment(Qt.AlignmentFlag.AlignLeft)
+                        self.tree.setItemWidget(child, 6, bw)
+                    edit_url = _exp_edit_link(e)
+                    if edit_url:
+                        el = QLabel(f"✏️ <a href='{edit_url}'>แก้ไข</a>")
+                        el.setTextFormat(Qt.TextFormat.RichText)
+                        el.setOpenExternalLinks(True)
+                        el.setStyleSheet("font-size:12px;padding-left:4px;background:transparent;")
+                        self.tree.setItemWidget(child, 7, el)
+                    if keep and eid == keep:
+                        target_item = child
 
             top.setExpanded(True)
 
-        self.lbl_total.setText(
-            f"รวมทั้งหมด {sum(len(g) for g in self._days)} รายการ • "
-            f"{fmt_amount(grand)} บาท • กระจาย {len(self._days)} วัน")
+        n_normal = sum(len(g) for g in self._days)
+        n_small = len(self._small_items)
+        n_urgent = len(self._urgent_items)
+        parts = [f"ปกติ {n_normal} รายการ • {fmt_amount(grand)} บาท • {len(self._days)} วัน"]
+        if n_small:
+            parts.append(f"ย่อย {n_small}")
+        if n_urgent:
+            parts.append(f"ด่วน {n_urgent}")
+        self.lbl_total.setText(" | ".join(parts))
+        # อัปเดตปุ่มดูย่อย/ด่วน
+        if hasattr(self, "btn_view_small"):
+            s_total = sum(_amount(e) for e in self._small_items)
+            self.btn_view_small.setText(
+                f"🔵 รายจ่ายย่อย ({n_small} รายการ • {fmt_amount(s_total)})"
+                if n_small else "🔵 รายจ่ายย่อย (ไม่มี)")
+        if hasattr(self, "btn_view_urgent"):
+            all_u = self._collect_all_urgent()
+            n_all_u = len(all_u)
+            u_total = sum(_amount(e) for e in all_u)
+            self.btn_view_urgent.setText(
+                f"🔴 รายจ่ายด่วน ({n_all_u} รายการ • {fmt_amount(u_total)})"
+                if n_all_u else "🔴 รายจ่ายด่วน (ไม่มี)")
 
         if target_item:
             self.tree.setCurrentItem(target_item)
@@ -1592,6 +1806,341 @@ class QueuePlanDialog(QDialog):
             f"ไม่อนุมัติ {len(ids)} รายการแล้ว\n"
             "ดู/อนุมัติกลับได้ที่ปุ่ม '📋 รายการไม่อนุมัติ'")
 
+    def _move_tier_to_queue(self, exp, tier_tag, tier_list, tree, dlg_title_update):
+        """ย้ายรายการจากตาราง ย่อย/ด่วน เข้าตารางคิวหลัก (วันที่ 1)"""
+        eid = _exp_id(exp)
+        # ลบออกจาก tier list
+        tier_list[:] = [e for e in tier_list if _exp_id(e) != eid]
+        # tag tier ไว้ที่ expense object เพื่อแสดง badge
+        exp["_tier_tag"] = tier_tag
+        # ใส่เข้าวันที่ 1 ของ main queue
+        self._days[0].insert(0, exp)
+        # ลบ item ออกจาก tree
+        idx = tree.indexOfTopLevelItem(tree.currentItem())
+        if idx >= 0:
+            tree.takeTopLevelItem(idx)
+        # อัปเดต title + label
+        dlg_title_update()
+        self._render()
+        self._update_buttons()
+
+    def _remove_tier_items(self):
+        """เอารายการย่อย/ด่วนที่ติ๊กไว้ออกจากคิว → ส่งกลับไปตาราง ย่อย/ด่วน ของตัวเอง"""
+        checked = []
+        for di, grp in enumerate(self._days):
+            for e in grp:
+                eid = _exp_id(e)
+                tag = e.get("_tier_tag", "")
+                if not tag:
+                    continue
+                # หา tree item ที่ checked
+                for ti in range(self.tree.topLevelItemCount()):
+                    top = self.tree.topLevelItem(ti)
+                    for ci in range(top.childCount()):
+                        child = top.child(ci)
+                        data = child.data(0, Qt.ItemDataRole.UserRole)
+                        if data and data[1] == eid and child.checkState(0) == Qt.CheckState.Checked:
+                            checked.append((di, e, tag))
+        if not checked:
+            QMessageBox.information(self, "ไม่ได้เลือก",
+                "กรุณาติ๊ก ☑️ หน้ารายการย่อย/ด่วน ที่ต้องการเอาออกก่อนครับ\n"
+                "(เฉพาะรายการที่มี 🔵/🔴 นำหน้าเท่านั้น)")
+            return
+        n_small = sum(1 for _, _, t in checked if t == "รายการย่อย")
+        n_urgent = sum(1 for _, _, t in checked if t == "รายการด่วน")
+        parts = []
+        if n_small:
+            parts.append(f"ย่อย {n_small}")
+        if n_urgent:
+            parts.append(f"ด่วน {n_urgent}")
+        if QMessageBox.question(self, "เอาออก",
+                f"เอา {' + '.join(parts)} รายการ ออกจากคิว?\n"
+                "รายการจะกลับไปอยู่ในตาราง ย่อย/ด่วน ตามเดิม",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+                ) != QMessageBox.StandardButton.Yes:
+            return
+        for di, exp, tag in checked:
+            # ลบออกจาก days
+            eid = _exp_id(exp)
+            self._days[di] = [e for e in self._days[di] if _exp_id(e) != eid]
+            # ลบ tag
+            if "_tier_tag" in exp:
+                del exp["_tier_tag"]
+            # ส่งกลับไปตาราง ย่อย/ด่วน
+            if tag == "รายการย่อย":
+                self._small_items.append(exp)
+            elif tag == "รายการด่วน":
+                self._urgent_items.append(exp)
+        self._render()
+        self._update_buttons()
+        self.lbl_hint.setText(f"↩️ เอาออก {len(checked)} รายการ กลับไปตาราง ย่อย/ด่วน")
+
+    def _view_small_items(self):
+        """หน้าต่างดูรายการย่อย ≤10k — ดับเบิลคลิกเพื่อย้ายเข้าคิวหลัก"""
+        items = self._small_items
+        total = sum(_amount(e) for e in items)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"🔵 รายจ่ายย่อย — {len(items)} รายการ • {fmt_amount(total)} บาท")
+        dlg.resize(780, 520)
+        vl = QVBoxLayout(dlg)
+        head = QLabel(
+            f"รายการยอด ≤10,000 บาท — แยกออกอัตโนมัติ ไม่นับรวมในวงเงิน 150,000/วัน\n"
+            f"จ่ายภายใน 7 วันทำการ\n"
+            f"💡 ดับเบิลคลิกรายการเพื่อย้ายเข้าตารางจัดคิว")
+        head.setStyleSheet("color:#1e40af;font-size:13px;font-weight:600;"
+                           "background:#dbeafe;border-radius:4px;padding:8px;")
+        vl.addWidget(head)
+        lbl_count = QLabel(f"รวม {len(items)} รายการ • {fmt_amount(total)} บาท")
+        lbl_count.setStyleSheet("color:#1e40af;font-size:12px;font-weight:600;padding:2px 0;")
+        vl.addWidget(lbl_count)
+        tree = QTreeWidget()
+        tree.setColumnCount(5)
+        tree.setHeaderLabels(["ผู้รับเงิน / Vendor", "เลขที่เอกสาร", "แบรนด์", "ครบกำหนด", "จำนวนเงิน (บาท)"])
+        tree.setColumnWidth(0, 260); tree.setColumnWidth(1, 130)
+        tree.setColumnWidth(2, 100); tree.setColumnWidth(3, 95); tree.setColumnWidth(4, 120)
+        tree.setAlternatingRowColors(True)
+        tree.setStyleSheet("QTreeWidget{border:1px solid #e2e8f0;font-size:13px;}"
+                           "QTreeWidget::item{padding:3px 0;}")
+        _by_eid = {}
+        for e in items:
+            vendor = _vendor(e) or "—"
+            doc = _doc_no(e)
+            brand = _brand_name(e, self._assignments) or "—"
+            due = fmt_date(_due(e)) if _due(e) else "—"
+            amt = _amount(e)
+            it = QTreeWidgetItem([vendor, doc, brand, due, fmt_amount(amt)])
+            it.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            it.setToolTip(0, "ดับเบิลคลิกเพื่อย้ายเข้าตารางจัดคิว")
+            _by_eid[id(it)] = e
+            tree.addTopLevelItem(it)
+
+        def _on_dblclick(item, col):
+            exp = _by_eid.get(id(item))
+            if not exp:
+                return
+            def _upd():
+                t = sum(_amount(e) for e in self._small_items)
+                dlg.setWindowTitle(f"🔵 รายจ่ายย่อย — {len(self._small_items)} รายการ • {fmt_amount(t)} บาท")
+                lbl_count.setText(f"รวม {len(self._small_items)} รายการ • {fmt_amount(t)} บาท")
+            self._move_tier_to_queue(exp, "รายการย่อย", self._small_items, tree, _upd)
+
+        tree.itemDoubleClicked.connect(_on_dblclick)
+        vl.addWidget(tree, 1)
+        btn_close = QPushButton("ปิด")
+        btn_close.setStyleSheet("QPushButton{padding:6px 18px;border:1px solid #cbd5e1;"
+                                "border-radius:4px;background:white;}QPushButton:hover{background:#f1f5f9;}")
+        btn_close.clicked.connect(dlg.close)
+        bl = QHBoxLayout(); bl.addStretch(); bl.addWidget(btn_close)
+        vl.addLayout(bl)
+        dlg.exec()
+
+    def _collect_all_urgent(self):
+        """รวมรายการด่วนทั้งหมด: ทั้งที่อยู่ใน _urgent_items (overflow)
+        และที่ auto-import เข้า _days แล้ว (มี _tier_tag == 'รายการด่วน')"""
+        all_u = list(self._urgent_items)
+        seen = {_exp_id(e) for e in all_u}
+        for grp in self._days:
+            for e in grp:
+                if e.get("_tier_tag") == "รายการด่วน" and _exp_id(e) not in seen:
+                    all_u.append(e)
+                    seen.add(_exp_id(e))
+        return all_u
+
+    def _view_urgent_items(self):
+        """หน้าต่างดูรายการด่วน ≤20k — เพิ่ม/ลบ/ย้ายเข้าคิว"""
+        all_urgent = self._collect_all_urgent()
+        total = sum(_amount(e) for e in all_urgent)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"🔴 รายจ่ายด่วน — {len(all_urgent)} รายการ • {fmt_amount(total)} บาท")
+        dlg.resize(820, 560)
+        vl = QVBoxLayout(dlg)
+        head = QLabel(
+            f"รายการด่วน ≤{fmt_amount(expense_tiers.URGENT_THRESHOLD)} บาท\n"
+            f"จ่ายภายใน {expense_tiers.URGENT_PAY_DAYS} วันทำการ • "
+            f"วงเงิน {fmt_amount(expense_tiers.URGENT_DAILY_LIMIT)}/วัน")
+        head.setStyleSheet("color:#991b1b;font-size:13px;font-weight:600;"
+                           "background:#fee2e2;border-radius:4px;padding:8px;")
+        vl.addWidget(head)
+        lbl_count = QLabel(f"รวม {len(all_urgent)} รายการ • {fmt_amount(total)} บาท")
+        lbl_count.setStyleSheet("color:#991b1b;font-size:12px;font-weight:600;padding:2px 0;")
+        vl.addWidget(lbl_count)
+
+        # ── toolbar: เพิ่ม / ปรับเป็นธรรมดา ──
+        tb = QHBoxLayout()
+        btn_add = QPushButton("➕ เพิ่มรายการด่วน")
+        btn_add.setStyleSheet(
+            "QPushButton{padding:5px 14px;border:1px solid #dc2626;border-radius:4px;"
+            "background:white;color:#dc2626;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background:#fef2f2;}")
+        btn_revert = QPushButton("↩️ ปรับเป็นรายการธรรมดา")
+        btn_revert.setStyleSheet(
+            "QPushButton{padding:5px 14px;border:1px solid #6b7280;border-radius:4px;"
+            "background:white;color:#374151;font-size:12px;font-weight:600;}"
+            "QPushButton:hover{background:#f3f4f6;}")
+        tb.addWidget(btn_add); tb.addWidget(btn_revert); tb.addStretch()
+        vl.addLayout(tb)
+
+        tree = QTreeWidget()
+        tree.setColumnCount(6)
+        tree.setHeaderLabels(["ผู้รับเงิน / Vendor", "เลขที่เอกสาร", "แบรนด์",
+                               "ครบกำหนด", "จำนวนเงิน (บาท)", "สถานะ"])
+        tree.setColumnWidth(0, 240); tree.setColumnWidth(1, 130)
+        tree.setColumnWidth(2, 90); tree.setColumnWidth(3, 90)
+        tree.setColumnWidth(4, 110); tree.setColumnWidth(5, 90)
+        tree.setAlternatingRowColors(True)
+        tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+        tree.setStyleSheet("QTreeWidget{border:1px solid #e2e8f0;font-size:13px;}"
+                           "QTreeWidget::item{padding:3px 0;}")
+        _by_eid = {}
+
+        def _refresh_tree():
+            tree.clear()
+            _by_eid.clear()
+            cur = self._collect_all_urgent()
+            for e in cur:
+                vendor = _vendor(e) or "—"
+                doc = _doc_no(e)
+                brand = _brand_name(e, self._assignments) or "—"
+                due = fmt_date(_due(e)) if _due(e) else "—"
+                amt = _amount(e)
+                in_queue = e.get("_tier_tag") == "รายการด่วน"
+                status = "อยู่ในคิว" if in_queue else "รอจัด"
+                it = QTreeWidgetItem([vendor, doc, brand, due, fmt_amount(amt), status])
+                it.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if in_queue:
+                    it.setForeground(5, QColor("#16a34a"))
+                else:
+                    it.setForeground(5, QColor("#dc2626"))
+                _by_eid[id(it)] = e
+                tree.addTopLevelItem(it)
+            t = sum(_amount(e) for e in cur)
+            n = len(cur)
+            dlg.setWindowTitle(f"🔴 รายจ่ายด่วน — {n} รายการ • {fmt_amount(t)} บาท")
+            lbl_count.setText(f"รวม {n} รายการ • {fmt_amount(t)} บาท")
+
+        _refresh_tree()
+        vl.addWidget(tree, 1)
+
+        # ── เพิ่มรายการด่วน: เลือกจากรายการในคิวปกติ (self._days) ที่ ≤20k ──
+        def _add_urgent():
+            pool = []
+            for grp in self._days:
+                for e in grp:
+                    if e.get("_tier_tag"):
+                        continue
+                    if _amount(e) <= expense_tiers.URGENT_THRESHOLD and _amount(e) > 0:
+                        pool.append(e)
+            if not pool:
+                QMessageBox.information(dlg, "ไม่มีรายการ",
+                    f"ไม่มีรายการในคิวปกติที่ ≤{fmt_amount(expense_tiers.URGENT_THRESHOLD)} บาท")
+                return
+            pick = QDialog(dlg)
+            pick.setWindowTitle("เลือกรายการเพิ่มเป็นด่วน")
+            pick.resize(750, 480)
+            pl = QVBoxLayout(pick)
+            plbl = QLabel(f"เลือกรายการที่ต้องการตั้งเป็นด่วน (≤{fmt_amount(expense_tiers.URGENT_THRESHOLD)} บาท)\n"
+                          "ติ๊ก ☑️ แล้วกด ยืนยัน")
+            plbl.setStyleSheet("color:#991b1b;font-size:13px;font-weight:600;"
+                               "background:#fee2e2;border-radius:4px;padding:8px;")
+            pl.addWidget(plbl)
+            ptree = QTreeWidget()
+            ptree.setColumnCount(5)
+            ptree.setHeaderLabels(["", "ผู้รับเงิน / Vendor", "เลขที่เอกสาร",
+                                    "ครบกำหนด", "จำนวนเงิน (บาท)"])
+            ptree.setColumnWidth(0, 35); ptree.setColumnWidth(1, 250)
+            ptree.setColumnWidth(2, 130); ptree.setColumnWidth(3, 95); ptree.setColumnWidth(4, 120)
+            ptree.setAlternatingRowColors(True)
+            ptree.setStyleSheet("QTreeWidget{border:1px solid #e2e8f0;font-size:13px;}"
+                                "QTreeWidget::item{padding:3px 0;}")
+            _pick_map = {}
+            for e in sorted(pool, key=lambda x: _amount(x)):
+                vendor = _vendor(e) or "—"
+                doc = _doc_no(e)
+                due = fmt_date(_due(e)) if _due(e) else "—"
+                amt = _amount(e)
+                it = QTreeWidgetItem(["", vendor, doc, due, fmt_amount(amt)])
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(0, Qt.CheckState.Unchecked)
+                it.setTextAlignment(4, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                _pick_map[id(it)] = e
+                ptree.addTopLevelItem(it)
+            pl.addWidget(ptree, 1)
+            pbl = QHBoxLayout()
+            btn_ok = QPushButton("✅ ยืนยัน")
+            btn_ok.setStyleSheet(
+                "QPushButton{padding:6px 18px;border:1px solid #dc2626;border-radius:4px;"
+                "background:#dc2626;color:white;font-weight:600;}"
+                "QPushButton:hover{background:#b91c1c;}")
+            btn_cancel = QPushButton("ยกเลิก")
+            btn_cancel.setStyleSheet(
+                "QPushButton{padding:6px 18px;border:1px solid #cbd5e1;"
+                "border-radius:4px;background:white;}QPushButton:hover{background:#f1f5f9;}")
+            btn_ok.clicked.connect(pick.accept)
+            btn_cancel.clicked.connect(pick.reject)
+            pbl.addStretch(); pbl.addWidget(btn_cancel); pbl.addWidget(btn_ok)
+            pl.addLayout(pbl)
+            if pick.exec() != QDialog.DialogCode.Accepted:
+                return
+            picked_exps = []
+            for i in range(ptree.topLevelItemCount()):
+                it = ptree.topLevelItem(i)
+                if it.checkState(0) == Qt.CheckState.Checked:
+                    e = _pick_map.get(id(it))
+                    if e:
+                        picked_exps.append(e)
+            if not picked_exps:
+                return
+            for e in picked_exps:
+                eid = _exp_id(e)
+                expense_tiers.set_urgent(eid)
+                e["_tier_tag"] = "รายการด่วน"
+            _refresh_tree()
+            self._persist_plan()
+            self._render()
+            self._update_buttons()
+
+        btn_add.clicked.connect(_add_urgent)
+
+        # ── ปรับเป็นรายการธรรมดา: เอารายการที่เลือกออกจากด่วน ──
+        def _revert_normal():
+            selected = tree.selectedItems()
+            if not selected:
+                QMessageBox.information(dlg, "ไม่ได้เลือก",
+                    "กรุณาคลิกเลือกรายการที่ต้องการปรับเป็นธรรมดาก่อน\n"
+                    "(คลิกเลือกได้หลายรายการโดยกด Ctrl ค้างไว้)")
+                return
+            exps = [_by_eid[id(it)] for it in selected if id(it) in _by_eid]
+            if not exps:
+                return
+            names = "\n".join(f"  • {_vendor(e) or _doc_no(e)}" for e in exps[:5])
+            if len(exps) > 5:
+                names += f"\n  ... และอีก {len(exps)-5} รายการ"
+            if QMessageBox.question(dlg, "ปรับเป็นธรรมดา",
+                    f"ปรับ {len(exps)} รายการกลับเป็นรายการธรรมดา?\n{names}",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+                    ) != QMessageBox.StandardButton.Yes:
+                return
+            for e in exps:
+                eid = _exp_id(e)
+                expense_tiers.clear_urgent(eid)
+                self._urgent_items[:] = [x for x in self._urgent_items if _exp_id(x) != eid]
+                if "_tier_tag" in e:
+                    del e["_tier_tag"]
+            _refresh_tree()
+            self._persist_plan()
+            self._render()
+            self._update_buttons()
+
+        btn_revert.clicked.connect(_revert_normal)
+
+        btn_close = QPushButton("ปิด")
+        btn_close.setStyleSheet("QPushButton{padding:6px 18px;border:1px solid #cbd5e1;"
+                                "border-radius:4px;background:white;}QPushButton:hover{background:#f1f5f9;}")
+        btn_close.clicked.connect(dlg.close)
+        bl = QHBoxLayout(); bl.addStretch(); bl.addWidget(btn_close)
+        vl.addLayout(bl)
+        dlg.exec()
+
     def _view_rejected_plan(self):
         """หน้ารายการไม่อนุมัติ (ใช้ dialog กลาง) — อนุมัติกลับแล้วนำกลับเข้าคิวทันที"""
         dlg = RejectedListDialog(self)
@@ -1703,11 +2252,23 @@ class QueuePlanDialog(QDialog):
                 ) != QMessageBox.StandardButton.Yes:
             return
         queue_plan.clear_plan()
-        allitems = [e for grp in self._days for e in grp]
+        # รวม normal + tier items ที่อยู่ในคิว กลับมาจัดใหม่ทั้งหมด
+        allitems = []
+        for grp in self._days:
+            for e in grp:
+                tag = e.pop("_tier_tag", None)
+                if tag == "รายการย่อย":
+                    self._small_items.append(e)
+                elif tag == "รายการด่วน":
+                    self._urgent_items.append(e)
+                else:
+                    allitems.append(e)
         self._days = self._distribute(allitems)
-        self._day_dates_override = {}   # จัดใหม่ → ล้างวันจ่ายที่กำหนดเอง
+        self._day_dates_override = {}
         self._saved_at = ""
         self.lbl_saved.setText("")
+        self._auto_import_tiers()
+        self._persist_plan()
         self._render()
         self._update_buttons()
 
@@ -2877,10 +3438,10 @@ class QueueTab(QWidget):
     status_message = pyqtSignal(str)
     company_changed = pyqtSignal()   # แจ้งเมื่อสลับบริษัท
 
-    COLS = ["", "เลขที่เอกสาร", "ผู้รับเงิน / Vendor", "แบรนด์", "ครบกำหนด", "วันที่จ่าย", "ยอดเงิน (บาท)", "สถานะ", "Statement Match", "เลขที่วางบิล", "หมายเหตุ (พิมพ์ได้)", "ลิงก์แชร์ / ลิงก์แก้ไข", "แนบไฟล์เข้า FlowAccount", "🗑️ ลบ"]
+    COLS = ["", "เลขที่เอกสาร", "ผู้รับเงิน / Vendor", "แบรนด์", "ครบกำหนด", "วันที่จ่าย", "ยอดเงิน (บาท)", "สถานะ", "Statement Match", "เลขที่วางบิล", "หมายเหตุ (พิมพ์ได้)", "ลิงก์แชร์ / ลิงก์แก้ไข", "แนบไฟล์เข้า FlowAccount", "🗑️ ลบ", "📜 เคยจัดคิว"]
     # ตัวเลือกสถานะที่กดเปลี่ยนได้จากเซลล์ (✅ จ่ายแล้ว = บันทึกเข้า FlowAccount จริง)
     STATUS_OPTS = ["🟡 รอจ่าย", "🔵 อนุมัติแล้ว", "🟣 จ่ายแล้วรออัพเดต",
-                   "🚫 ไม่อนุมัติ", "✅ จ่ายแล้ว"]
+                   "🚫 ไม่อนุมัติ", "✅ จ่ายแล้ว", "⚡ ด่วน"]
 
     def __init__(self):
         super().__init__()
@@ -2904,6 +3465,8 @@ class QueueTab(QWidget):
         # Smart Auto-Refresh — ติดตามครั้งล่าสุดที่ refresh cache
         self._last_smart_refresh = None
         self._worker = None
+        self._doc_history_idx: dict = {}
+        self._doc_history_worker = None
         self._build_ui()
 
     def _build_ui(self):
@@ -3069,6 +3632,12 @@ class QueueTab(QWidget):
         toolbar.addWidget(self.btn_refresh)
         toolbar.addWidget(self.btn_add)
         toolbar.addStretch()
+        btn_credit = QPushButton("🏪 ร้านค้าเครดิต")
+        btn_credit.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_credit.setToolTip("จัดการรายชื่อร้านค้าเครดิต (ไม่นับเป็นรายการย่อย)")
+        self._style_btn(btn_credit, "#7c3aed")
+        btn_credit.clicked.connect(lambda: CreditVendorDialog(self).exec())
+        toolbar.addWidget(btn_credit)
         toolbar.addWidget(self.lbl_fetched)
         toolbar.addWidget(self.btn_export_link)
         toolbar.addWidget(self.btn_csv)
@@ -3166,6 +3735,7 @@ class QueueTab(QWidget):
         self.table.setColumnWidth(11, 190)  # ลิงก์แชร์ / ลิงก์แก้ไข
         self.table.setColumnWidth(12, 70)   # แนบไฟล์
         self.table.setColumnWidth(13, 60)   # ลบ
+        self.table.setColumnWidth(14, 100)  # เคยจัดคิว
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         # อนุญาตแก้ไขเฉพาะช่องที่ตั้ง ItemIsEditable (คอลัมน์หมายเหตุ) — ช่องอื่นแก้ไม่ได้
@@ -3609,6 +4179,19 @@ class QueueTab(QWidget):
             + (f" + ที่เพิ่มเอง {manual_n} รายการ" if manual_n else ""))
         activity_log.log("ดึงข้อมูล", f"ดึงค่าใช้จ่าย {len(expenses)} รายการ",
                          "ทุกบริษัท" if self._combined else "")
+        self._start_doc_history_fetch()
+
+    def _start_doc_history_fetch(self):
+        """โหลด/รีเฟรชดัชนี 'เคยจัดคิวกี่ครั้ง' เบื้องหลัง — ไม่บล็อก UI"""
+        if self._doc_history_worker is not None and self._doc_history_worker.isRunning():
+            return
+        self._doc_history_worker = DocHistoryIndexWorker(self)
+        self._doc_history_worker.done.connect(self._on_doc_history_done)
+        self._doc_history_worker.start()
+
+    def _on_doc_history_done(self, idx: dict):
+        self._doc_history_idx = idx or {}
+        self._render_page()
 
     def _on_fetch_error(self, msg: str):
         if getattr(self, "_loading", None):
@@ -3985,8 +4568,24 @@ class QueueTab(QWidget):
             pay = _payment_date(exp)
             self.table.setItem(row, 5, cell(fmt_date(pay) if pay else "—",
                                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter))
-            amt_item = cell(fmt_amount(amt),
+            # tier badge + amount
+            tier = expense_tiers.get_tier(eid, amt, _vendor(exp))
+            tier_prefix = ""
+            tier_color = None
+            if tier == expense_tiers.TIER_URGENT:
+                tier_prefix = "🔴 "
+                tier_color = QColor("#dc2626")
+            elif tier == expense_tiers.TIER_SMALL:
+                tier_prefix = "🔵 "
+                tier_color = QColor("#2563eb")
+            amt_item = cell(tier_prefix + fmt_amount(amt),
                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+            if tier_color:
+                f = amt_item.font(); f.setBold(True); amt_item.setFont(f)
+            if tier == expense_tiers.TIER_URGENT:
+                amt_item.setToolTip("ด่วน — จ่ายใน 2 วันทำการ (วงเงิน ≤20,000/วัน)")
+            elif tier == expense_tiers.TIER_SMALL:
+                amt_item.setToolTip("ยอดย่อย ≤10,000 — จ่ายใน 7 วันทำการ")
             self.table.setItem(row, 6, amt_item)
 
             # status — กดเปลี่ยนได้จากเซลล์ (dropdown). 'จ่ายแล้ว' บันทึกเข้า FlowAccount จริง
@@ -3998,6 +4597,8 @@ class QueueTab(QWidget):
                     cur = "🚫 ไม่อนุมัติ"
                 elif paid_pending.is_pending(eid):
                     cur = "🟣 จ่ายแล้วรออัพเดต"
+                elif tier == expense_tiers.TIER_URGENT:
+                    cur = "⚡ ด่วน"
                 elif "approved" in st:
                     cur = "🔵 อนุมัติแล้ว"
                 else:
@@ -4011,6 +4612,40 @@ class QueueTab(QWidget):
                     lambda txt, e=exp: self._on_status_changed(e, txt))
                 self.table.setItem(row, 7, QTableWidgetItem())  # เซลล์ว่างรองรับ widget
                 self.table.setCellWidget(row, 7, combo)
+
+            # tier toggle button (urgent) — สำหรับรายการ ≤20,000 ที่ยังไม่จ่าย
+            if amt <= expense_tiers.URGENT_THRESHOLD and not ("paid" in st or pay):
+                if tier == expense_tiers.TIER_URGENT:
+                    _tbtn = QPushButton("🔴 ด่วน")
+                    _tbtn.setStyleSheet(
+                        "QPushButton{background:#fee2e2;color:#dc2626;font-size:11px;font-weight:bold;"
+                        "border:1px solid #fca5a5;border-radius:4px;padding:2px 8px;}"
+                        "QPushButton:hover{background:#fecaca;}")
+                    _tbtn.setToolTip("คลิกเพื่อยกเลิกด่วน")
+                    _tbtn.clicked.connect(lambda _=False, _eid=eid: self._toggle_urgent(_eid, False))
+                else:
+                    _tbtn = QPushButton("⚡ ตั้งด่วน")
+                    _tbtn.setStyleSheet(
+                        "QPushButton{background:#f0f9ff;color:#2563eb;font-size:11px;"
+                        "border:1px solid #bfdbfe;border-radius:4px;padding:2px 8px;}"
+                        "QPushButton:hover{background:#dbeafe;}")
+                    _tbtn.setToolTip("คลิกเพื่อตั้งเป็นด่วน (จ่ายใน 2 วัน)")
+                    _tbtn.clicked.connect(lambda _=False, _eid=eid: self._toggle_urgent(_eid, True))
+                _tbtn.setCursor(Qt.CursorShape.PointingHandCursor)
+                _tw = QWidget(); _tl = QHBoxLayout(_tw)
+                _tl.addWidget(_tbtn); _tl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                _tl.setContentsMargins(2, 0, 2, 0)
+                # ใส่ข้าง status combo ถ้ามี หรือแทนที่ cell widget
+                existing_w = self.table.cellWidget(row, 7)
+                if existing_w and isinstance(existing_w, NoScrollComboBox):
+                    pass  # combo อยู่แล้ว ไม่แทน
+                container = QWidget()
+                cl = QHBoxLayout(container); cl.setContentsMargins(2, 0, 2, 0); cl.setSpacing(4)
+                if existing_w:
+                    self.table.removeCellWidget(row, 7)
+                    cl.addWidget(existing_w)
+                cl.addWidget(_tbtn)
+                self.table.setCellWidget(row, 7, container)
 
             # col 8: match
             stmt = self._matched.get(eid)
@@ -4093,8 +4728,69 @@ class QueueTab(QWidget):
             dw.setStyleSheet("background:#fee2e2;")
             self.table.setCellWidget(row, 13, dw)
 
+            # col 14: เคยจัดคิว — กดดูวันที่/รายละเอียดแต่ละครั้งที่เคยถูกจัดคิว
+            doc_no = _doc_no(exp)
+            hist = self._doc_history_idx.get(doc_no) or []
+            n_hist = len(hist)
+            if n_hist:
+                btn_h = QPushButton(f"📜 {n_hist} ครั้ง")
+                btn_h.setToolTip("กดดูว่าเคยถูกจัดคิววันไหนบ้าง")
+                btn_h.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_h.setStyleSheet(
+                    "QPushButton{border:1px solid #93c5fd;background:#eff6ff;color:#1d4ed8;"
+                    "border-radius:4px;padding:2px 8px;font-size:11px;font-weight:600;}"
+                    "QPushButton:hover{background:#dbeafe;}")
+                btn_h.clicked.connect(
+                    lambda _=False, dn=doc_no, h=hist, vn=_vendor(exp): self._show_doc_history(dn, h, vn))
+                hw = QWidget(); hl = QHBoxLayout(hw)
+                hl.addWidget(btn_h); hl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                hl.setContentsMargins(2, 0, 2, 0)
+                self.table.setCellWidget(row, 14, hw)
+            else:
+                self.table.setItem(row, 14, cell("—",
+                                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter))
+
         self._loading = False
         self._update_buttons()
+
+    def _show_doc_history(self, doc_no: str, hist: list, vendor: str = ""):
+        """แสดง popup รายละเอียดว่าเอกสารนี้เคยถูกจัดคิวไปแล้วกี่ครั้ง วันไหนบ้าง"""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"📜 ประวัติการจัดคิว — {doc_no}")
+        dlg.resize(480, 380)
+        lay = QVBoxLayout(dlg)
+
+        head = QLabel(f"{doc_no}  •  {vendor or '(ไม่ระบุ)'}\nเคยถูกจัดคิวไปแล้ว {len(hist)} ครั้ง")
+        head.setStyleSheet("color:#1d4ed8;font-size:13px;font-weight:600;")
+        lay.addWidget(head)
+
+        tbl = QTableWidget(0, 3)
+        tbl.setHorizontalHeaderLabels(["บันทึกเมื่อ", "จัดคิววันที่", "ยอด (บาท)"])
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for h in hist:
+            r = tbl.rowCount()
+            tbl.insertRow(r)
+            t = str(h.get("time", "")).replace("T", " ")[:19]
+            d = h.get("date", "") or "-"
+            amt = h.get("amount")
+            amt_s = fmt_amount(float(amt)) if amt not in (None, "") else "-"
+            tbl.setItem(r, 0, QTableWidgetItem(t))
+            tbl.setItem(r, 1, QTableWidgetItem(fmt_date(d) if d and d != "-" else "-"))
+            it_amt = QTableWidgetItem(amt_s)
+            it_amt.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            tbl.setItem(r, 2, it_amt)
+        lay.addWidget(tbl, 1)
+
+        btn_close = QPushButton("ปิด")
+        btn_close.clicked.connect(dlg.accept)
+        row_btn = QHBoxLayout()
+        row_btn.addStretch(1)
+        row_btn.addWidget(btn_close)
+        lay.addLayout(row_btn)
+        dlg.exec()
 
     def _on_check_changed(self, state):
         chk = self.sender()
@@ -4104,6 +4800,15 @@ class QueueTab(QWidget):
         else:
             self._selected.discard(eid)
         self._update_buttons()
+
+    def _toggle_urgent(self, eid: str, make_urgent: bool):
+        if make_urgent:
+            expense_tiers.set_urgent(eid)
+            self.status_message.emit(f"✅ ตั้ง {eid} เป็นด่วน (จ่ายใน 2 วัน)")
+        else:
+            expense_tiers.clear_tier(eid)
+            self.status_message.emit(f"↩️ ยกเลิกด่วน {eid}")
+        self._render_page()
 
     def _auto_queue(self):
         """จัดคิวอัตโนมัติ — กระจายเป็นหลายวัน (ค่าเริ่มต้น 3 วัน) แล้วเลือกทั้งหมด
@@ -4194,13 +4899,31 @@ class QueueTab(QWidget):
         # กดจัดคิวใหม่ → ดีดการจัดเรียงเดิมทิ้ง (ข้อ 10)
         queue_plan.clear_plan()
 
-        # กระจายเป็นวัน ๆ (best-fit, เกินกำหนดก่อน, ข้ามเสาร์-อาทิตย์)
-        all_days = [d for d in distribute_into_days(candidates, self._daily_limit) if d["items"]]
+        # ── แยกปกติ (>10k) ออกจากย่อย/ด่วน ──
+        classified = expense_tiers.classify_expenses(candidates, amount_fn=_amount, vendor_fn=_vendor)
+        normal_items = classified[expense_tiers.TIER_NORMAL]
+        n_small = len(classified[expense_tiers.TIER_SMALL])
+        n_urgent = len(classified[expense_tiers.TIER_URGENT])
+
+        if not normal_items:
+            QMessageBox.information(self, "ไม่มีรายการ",
+                f"ไม่มีรายการปกติ (>10k) รอจ่าย\n"
+                f"(ย่อย ≤10k: {n_small} รายการ, ด่วน: {n_urgent} รายการ\n"
+                f"ดูได้ที่ ดูตารางคิว → ปุ่ม ย่อย/ด่วน)")
+            return
+
+        # กระจายเฉพาะ normal (best-fit 150k/วัน)
+        all_days = [d for d in distribute_into_days(normal_items, self._daily_limit) if d["items"]]
         maxd = len(all_days)
+
+        extra_info = ""
+        if n_small or n_urgent:
+            extra_info = f"\n(แยกออก: ย่อย ≤10k {n_small} รายการ, ด่วน {n_urgent} รายการ)"
 
         n, ok = QInputDialog.getInt(
             self, "🤖 จัดคิวอัตโนมัติ",
-            f"มีรายการรอจ่ายจัดได้ทั้งหมด {maxd} วัน{month_label}\nต้องการจัดคิวกี่วัน?",
+            f"มีรายการปกติ (>10k) จัดได้ {maxd} วัน{month_label}{extra_info}\n"
+            f"ต้องการจัดคิวกี่วัน?",
             min(3, maxd), 1, maxd)
         if not ok:
             return
@@ -4211,7 +4934,7 @@ class QueueTab(QWidget):
 
         # ── Preview: สรุปแต่ละวัน ──
         thai = ["จันทร์", "อังคาร", "พุธ", "พฤหัสบดี", "ศุกร์", "เสาร์", "อาทิตย์"]
-        msg = [f"จัดคิว {n} วัน:"]
+        msg = [f"จัดคิว {n} วัน (ปกติ >10k):"]
         for di, d in enumerate(days, 1):
             dt = d["date"]
             dtot = sum(_amount(e) for e in d["items"])
@@ -4219,6 +4942,8 @@ class QueueTab(QWidget):
                        f"{len(d['items'])} รายการ • {fmt_amount(dtot)} บาท")
         msg.append("─" * 40)
         msg.append(f"  รวม {len(picked)} รายการ • {fmt_amount(total)} บาท")
+        if n_small or n_urgent:
+            msg.append(f"  (ย่อย ≤10k: {n_small}, ด่วน: {n_urgent} — ดูที่ตารางคิว)")
 
         box = QMessageBox(self)
         box.setWindowTitle("🤖 จัดคิวอัตโนมัติ")
@@ -4372,19 +5097,24 @@ class QueueTab(QWidget):
                     QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Yes:
                 self._apply_filter()
                 return
-        if "รอจ่าย" in label:
+        if "ด่วน" in label:
+            expense_tiers.set_urgent(eid)
+            self.status_message.emit(f"⚡ ตั้งด่วน: {_doc_no(exp)}")
+            self._apply_filter()
+        elif "รอจ่าย" in label:
             paid_pending.unmark(eid); rejected.approve(eid)
+            expense_tiers.clear_urgent(eid)
             self.status_message.emit(f"↩️ คืนสถานะรอจ่าย: {_doc_no(exp)}")
             self._apply_filter()
         elif "รออัพเดต" in label:
-            rejected.approve(eid)
+            rejected.approve(eid); expense_tiers.clear_urgent(eid)
             paid_pending.mark(eid, {"amount": _amount(exp), "vendor": _vendor(exp),
                                     "doc": _doc_no(exp), "user": activity_log.current_user()})
             self.status_message.emit(f"🟣 จ่ายแล้วรออัพเดต: {_doc_no(exp)}")
             self._apply_filter()
         elif "ไม่อนุมัติ" in label:
             # ไม่อนุมัติ = ซ่อนในเครื่อง (ย้อนได้) — ถ้าจะลบจริงใช้ปุ่ม 🗑️ ลบ คอลัมน์สุดท้าย
-            paid_pending.unmark(eid)
+            paid_pending.unmark(eid); expense_tiers.clear_urgent(eid)
             rejected.reject(eid, {"vendor": _vendor(exp), "amount": _amount(exp),
                                   "doc": _doc_no(exp), "user": activity_log.current_user()})
             self.status_message.emit(f"🚫 ไม่อนุมัติ (ซ่อน): {_doc_no(exp)}")
@@ -4717,10 +5447,19 @@ class QueueTab(QWidget):
             by_id = {_exp_id(e): e for e in pool}
             saved_dates = saved.get("dates") or []
             used = set()
-            pairs = []   # (group, วันจ่ายที่บันทึก iso หรือ None) — คงลำดับให้ตรง dates
+            pairs = []
             for idx, day_ids in enumerate(saved["days"]):
-                grp = [by_id[i] for i in day_ids if i in by_id and i not in used]
+                grp = []
                 for i in day_ids:
+                    if i in by_id and i not in used:
+                        e = by_id[i]
+                        amt = _amount(e)
+                        tier = expense_tiers.get_tier(i, amt, _vendor(e))
+                        if tier == expense_tiers.TIER_SMALL:
+                            e["_tier_tag"] = "รายการย่อย"
+                        elif tier == expense_tiers.TIER_URGENT:
+                            e["_tier_tag"] = "รายการด่วน"
+                        grp.append(e)
                     used.add(i)
                 sd = saved_dates[idx] if idx < len(saved_dates) else None
                 pairs.append((grp, sd))
@@ -4793,11 +5532,10 @@ class QueueTab(QWidget):
         คืน (days, exps) หรือ None ถ้ายกเลิก/ไม่มีข้อมูล"""
         from PyQt6.QtWidgets import QInputDialog
         assignments = load_brands()
-        # ใช้รายการที่ติ๊กถ้าติ๊กไว้ ไม่งั้นใช้ทั้งหมดที่ยังไม่จ่าย (ไม่รวมที่ Mark รออัพเดต)
-        sel = self._selected_expenses()
-        pool = sel if sel else [e for e in self._expenses
-                                if _status(e) != "paid" and _amount(e) > 0
-                                and not paid_pending.is_pending(_exp_id(e))]
+        # ใช้ทั้งหมดที่ยังไม่จ่าย (ไม่รวมที่ Mark รออัพเดต) เพื่อให้ตรงกับตารางคิว
+        pool = [e for e in self._expenses
+                if _status(e) != "paid" and _amount(e) > 0
+                and not paid_pending.is_pending(_exp_id(e))]
         if not pool:
             QMessageBox.information(self, "ไม่มีรายการ",
                 "ไม่มีรายการให้ export — กด 🔄 รีเฟรช ดึงข้อมูลก่อนครับ")
@@ -4818,17 +5556,14 @@ class QueueTab(QWidget):
         # ใช้การจัดเรียงที่บันทึกจากตารางคิว (ถ้ามี) เพื่อให้ Export ตรงกับตารางคิว
         all_days = [d for d in self._days_saved_or_distribute(pool) if d["items"]]
         maxd = len(all_days)
-        if sel:
-            days = all_days
-        else:
-            n, ok = QInputDialog.getInt(
-                self, "Export คิวจ่ายกี่วัน?",
-                f"คิวจ่ายทั้งหมดจัดได้ {maxd} วัน (จากรายการที่ยังไม่จ่ายทั้งหมด)\n"
-                f"ต้องการ export กี่วัน?",
-                min(3, maxd), 1, maxd)
-            if not ok:
-                return None
-            days = all_days[:n]
+        n, ok = QInputDialog.getInt(
+            self, "Export คิวจ่ายกี่วัน?",
+            f"คิวจ่ายทั้งหมดจัดได้ {maxd} วัน (จากรายการที่ยังไม่จ่ายทั้งหมด)\n"
+            f"ต้องการ export กี่วัน?",
+            min(3, maxd), 1, maxd)
+        if not ok:
+            return None
+        days = all_days[:n]
         exps = [e for d in days for e in d["items"]]
 
         # ดึงลิงก์แชร์ที่ยังขาดให้ครบก่อน เพื่อให้ไฟล์ใช้ "ลิงก์แชร์จริง" ไม่ใช่ลิงก์แก้ไข
@@ -8737,7 +9472,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.2.3"
+APP_VERSION = "4.5"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -8869,6 +9604,17 @@ QToolTip { background-color: #2a2b2e; color: #e8eaed; border: 1px solid #5f6368;
 """
 
 CHANGELOG = [
+    {
+        "version": "4.5",
+        "date": "07/09/2569",
+        "title": "เช็คได้ว่ารายการไหนเคยถูกจัดคิวไปแล้วกี่ครั้ง",
+        "items": [
+            "หน้าคิวจ่ายเงิน: เพิ่มคอลัมน์ '📜 เคยจัดคิว' ท้ายตาราง — โชว์จำนวนครั้งที่เอกสารนั้นเคยถูกบันทึกอยู่ในประวัติการจัดคิวมาก่อน",
+            "นับจากประวัติการจัดคิวบน cloud ทุกเครื่อง/ทุกผู้ใช้ ไม่ใช่แค่เครื่องนี้",
+            "กดปุ่มจำนวนครั้ง → เปิดหน้าต่างดูรายละเอียดว่าเคยจัดคิวไปวันไหนบ้าง ยอดเท่าไหร่",
+            "ข้อมูลอัปเดตอัตโนมัติเบื้องหลังทุกครั้งที่กดรีเฟรชดึงข้อมูล ไม่บล็อกหน้าจอ",
+        ],
+    },
     {
         "version": "1.0",
         "date": "26/06/2569",
@@ -9146,7 +9892,191 @@ CHANGELOG = [
             "เลือกได้ว่าจะใส่เข้าวันที่ไหน — เพิ่มแล้วอย่าลืมกด 'บันทึกคิว'",
         ],
     },
+    {
+        "version": "4.4",
+        "date": "14/08/2569",
+        "title": "แยกยอดปกติ/ย่อย/ด่วน + ร้านค้าเครดิต (Cloud Sync)",
+        "items": [
+            "หน้าจัดคิว: แยกรายการแต่ละวันเป็นกลุ่ม ปกติ/ย่อย/ด่วน พร้อม sub-header แสดงจำนวน+ยอดรวม",
+            "Day header แสดงสรุปยอดแยก tier (ปกติ X รายการ XXX | ย่อย X รายการ XXX | ด่วน X รายการ XXX)",
+            "Export PDF/Excel/Link: จัดกลุ่มตาม tier เหมือนหน้าจัดคิว",
+            "เพิ่มระบบ 'ร้านค้าเครดิต' — ร้านที่ให้เครดิต ยอด ≤10,000 ไม่นับเป็นรายการย่อย",
+            "ปุ่ม 🏪 ร้านค้าเครดิต — เปิดหน้าต่างจัดการรายชื่อร้านค้าเครดิต (เพิ่ม/แก้ไข/ลบ)",
+            "ร้านค้าเครดิต sync ขึ้น cloud — แก้ไขที่เครื่องไหนก็เห็นเหมือนกันทุกเครื่อง",
+        ],
+    },
+    {
+        "version": "4.3.4",
+        "date": "14/08/2569",
+        "title": "เพิ่มลิงก์แก้ไขใบในหน้าจัดคิว + Cloud Sync ด่วน",
+        "items": [
+            "หน้าจัดคิว: เพิ่มคอลัมน์ 'แก้ไขใบ' — กดลิงก์เปิดหน้าแก้ไขเอกสารใน FlowAccount ได้เลย",
+            "รายการด่วนซิงค์ขึ้น cloud อัตโนมัติ — ตั้ง/เอาออกจากเครื่องไหนก็เห็นเหมือนกันทุกเครื่อง",
+            "ดึงข้อมูลด่วนจาก cloud ทุกครั้งที่เปิดโปรแกรมและเปิดหน้าจัดคิว",
+        ],
+    },
+    {
+        "version": "4.3.2",
+        "date": "13/08/2569",
+        "title": "แก้ด่วน: ID ตรงกันทั้งระบบ + เซฟถาวร + เห็นทุก user",
+        "items": [
+            "แก้ root cause: classify_expenses ใช้ ID ผิด field ทำให้ตั้งด่วนแล้วหาไม่เจอ",
+            "รายการด่วนเซฟถาวร (kcash_expense_tiers.json) จนกว่าจะกดเอาออกเอง",
+            "ปิดเปิดโปรแกรมรายการด่วนยังอยู่ / user อื่นเห็นเหมือนกัน",
+            "ปุ่มรายจ่ายด่วนนับรวมรายการที่อยู่ในคิวแล้วด้วย (ไม่ใช่แค่ overflow)",
+        ],
+    },
+    {
+        "version": "4.3.1",
+        "date": "13/08/2569",
+        "title": "เพิ่ม/ปรับรายการด่วนจากหน้าต่างด่วน + dropdown ⚡ ด่วน",
+        "items": [
+            "แก้ bug: ตั้งด่วนแล้วรายการไม่ขึ้นในหน้ารายจ่ายด่วน (กรณีมี saved plan)",
+            "หน้ารายจ่ายด่วน: ปุ่ม '➕ เพิ่มรายการด่วน' เปิด dialog ติ๊กเลือกรายการได้",
+            "หน้ารายจ่ายด่วน: ปุ่ม '↩️ ปรับเป็นรายการธรรมดา' เลือกแล้วกดปรับกลับ",
+            "Dropdown สถานะ: เพิ่ม '⚡ ด่วน' เลือกจาก dropdown ได้เลย (เปลี่ยนกลับ = เลือกรอจ่าย)",
+        ],
+    },
+    {
+        "version": "4.3",
+        "date": "13/08/2569",
+        "title": "ระบบจัดคิว 3 ระดับ: ปกติ / ย่อย / ด่วน",
+        "items": [
+            "แยกรายจ่ายอัตโนมัติ 3 ระดับ: ปกติ (>10,000), ย่อย (≤10,000), ด่วน (≤20,000 เลือกมือ)",
+            "ปุ่ม 'รายจ่ายย่อย' / 'รายจ่ายด่วน' ดูรายการแยก + ดับเบิลคลิกเพิ่มเข้าคิวได้",
+            "Auto-import ย่อย/ด่วน เข้าคิวอัตโนมัติ กระจายทุกวัน (ชื่อคนก่อน, ไม่เกินวงเงิน/วัน)",
+            "ปุ่ม 'เอาออก' ส่งรายการย่อย/ด่วน กลับไปตารางเดิม",
+            "Badge 🔵รายการย่อย / 🔴รายการด่วน ในตารางคิว + Export (PDF/Excel/ลิ้งค์)",
+            "Export (PDF/Excel/ลิ้งค์) ตรงกับตารางคิวที่แสดง 100%",
+            "กดจัดใหม่อัตโนมัติ ดึงรายการย่อย/ด่วน มาจัดด้วย",
+        ],
+    },
 ]
+
+
+class CreditVendorDialog(QDialog):
+    """หน้าต่างจัดการรายชื่อร้านค้าเครดิต (ไม่นับเป็นรายการย่อย)"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("จัดการร้านค้าเครดิต")
+        self.resize(900, 560)
+        lay = QVBoxLayout(self)
+
+        head = QLabel("🏪 ร้านค้าเครดิต — ไม่นับเป็นรายการย่อย")
+        head.setStyleSheet("font-size:16px;font-weight:800;color:#0f172a;")
+        lay.addWidget(head)
+        sub = QLabel("รายการย่อย (≤10,000 บาท) จากร้านค้าที่อยู่ในลิสต์นี้ จะถูกจัดเป็น 'ปกติ' แทน")
+        sub.setStyleSheet("color:#64748b;font-size:12px;margin-bottom:6px;")
+        lay.addWidget(sub)
+
+        # ปุ่ม เพิ่ม/ลบ
+        btn_row = QHBoxLayout()
+        btn_add = QPushButton("➕ เพิ่มร้านค้า")
+        btn_add.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_add.setStyleSheet(
+            "QPushButton{padding:5px 14px;border:1px solid #16a34a;border-radius:5px;"
+            "background:#dcfce7;color:#15803d;font-weight:700;font-size:12px;}"
+            "QPushButton:hover{background:#bbf7d0;}")
+        btn_add.clicked.connect(self._add_row)
+        btn_row.addWidget(btn_add)
+        btn_del = QPushButton("🗑️ ลบที่เลือก")
+        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_del.setStyleSheet(
+            "QPushButton{padding:5px 14px;border:1px solid #dc2626;border-radius:5px;"
+            "background:#fee2e2;color:#dc2626;font-weight:700;font-size:12px;}"
+            "QPushButton:hover{background:#fecaca;}")
+        btn_del.clicked.connect(self._del_selected)
+        btn_row.addWidget(btn_del)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        # ตาราง
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["ชื่อร้าน", "จำหน่ายสินค้า",
+                                              "เครดิต Term", "วงเงินเงื่อนไข", "หมายเหตุ"])
+        self.table.horizontalHeader().setStyleSheet(
+            "QHeaderView::section{background:#dcfce7;color:#15803d;font-weight:700;"
+            "padding:6px;border:1px solid #cbd5e1;}")
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet("QTableWidget{border:1px solid #e2e8f0;font-size:13px;}"
+                                  "QTableWidget::item{padding:4px;}")
+        from PyQt6.QtWidgets import QHeaderView
+        for i in range(5):
+            mode = QHeaderView.ResizeMode.Stretch if i == 0 else QHeaderView.ResizeMode.ResizeToContents
+            self.table.horizontalHeader().setSectionResizeMode(i, mode)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(self.table, 1)
+
+        # sync จาก cloud แล้วโหลด
+        try:
+            expense_tiers.sync_credit_vendors_from_cloud()
+        except Exception:
+            pass
+        self._data = expense_tiers.load_credit_vendors()
+        self._populate()
+
+        # ปุ่มบันทึก/ปิด
+        bot = QHBoxLayout()
+        bot.addStretch()
+        btn_save = QPushButton("💾 บันทึก")
+        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_save.setStyleSheet(
+            "QPushButton{padding:6px 20px;border:none;border-radius:5px;"
+            "background:#16a34a;color:white;font-weight:700;font-size:13px;}"
+            "QPushButton:hover{background:#15803d;}")
+        btn_save.clicked.connect(self._save)
+        bot.addWidget(btn_save)
+        btn_close = QPushButton("ปิด")
+        btn_close.setStyleSheet("QPushButton{padding:6px 18px;border:1px solid #cbd5e1;"
+                                "border-radius:5px;background:white;font-size:13px;}")
+        btn_close.clicked.connect(self.reject)
+        bot.addWidget(btn_close)
+        lay.addLayout(bot)
+
+    def _populate(self):
+        self.table.setRowCount(len(self._data))
+        for r, v in enumerate(self._data):
+            self.table.setItem(r, 0, QTableWidgetItem(v.get("name", "")))
+            self.table.setItem(r, 1, QTableWidgetItem(v.get("product", "")))
+            self.table.setItem(r, 2, QTableWidgetItem(v.get("term", "")))
+            self.table.setItem(r, 3, QTableWidgetItem(v.get("limit", "")))
+            self.table.setItem(r, 4, QTableWidgetItem(v.get("note", "")))
+
+    def _add_row(self):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        for c in range(5):
+            self.table.setItem(r, c, QTableWidgetItem(""))
+        self.table.scrollToBottom()
+        self.table.editItem(self.table.item(r, 0))
+
+    def _del_selected(self):
+        rows = sorted(set(idx.row() for idx in self.table.selectedIndexes()), reverse=True)
+        if not rows:
+            return
+        for r in rows:
+            self.table.removeRow(r)
+
+    def _save(self):
+        vendors = []
+        for r in range(self.table.rowCount()):
+            name = (self.table.item(r, 0) or QTableWidgetItem("")).text().strip()
+            if not name:
+                continue
+            vendors.append({
+                "name": name,
+                "product": (self.table.item(r, 1) or QTableWidgetItem("")).text().strip(),
+                "term": (self.table.item(r, 2) or QTableWidgetItem("")).text().strip(),
+                "limit": (self.table.item(r, 3) or QTableWidgetItem("")).text().strip(),
+                "note": (self.table.item(r, 4) or QTableWidgetItem("")).text().strip(),
+            })
+        expense_tiers.save_credit_vendors_with_cloud(vendors)
+        self._data = vendors
+        QMessageBox.information(self, "✅ บันทึกแล้ว",
+                                f"บันทึกร้านค้าเครดิต {len(vendors)} รายการ (sync cloud)")
+        self.accept()
 
 
 class ChangelogDialog(QDialog):
@@ -9940,6 +10870,15 @@ def main():
                     q = activity_log.load_queue_log(); q.reverse()
                     cloud_log.migrate_local_logs(cfg_m, a, q)
                 threading.Thread(target=_bg_migrate, daemon=True).start()
+        except Exception:
+            pass
+
+        # Cloud Expense Tiers — sync urgent status + credit vendors across machines
+        try:
+            cfg_t = config.load_config()
+            expense_tiers.init_cloud(cfg_t)
+            expense_tiers.sync_from_cloud()
+            expense_tiers.sync_credit_vendors_from_cloud()
         except Exception:
             pass
 

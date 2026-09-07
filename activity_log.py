@@ -160,6 +160,53 @@ def clear_queue_log() -> None:
     _save("kcash_queue_log.json", [])
 
 
+# ── Doc → History index (ข้อ "เคยจัดคิวไปแล้วกี่ครั้ง") ──
+def get_doc_history_index(limit: int = 3000) -> dict:
+    """รวบรวมประวัติการจัดคิวทั้งหมด (cloud ก่อน ถ้ามี ไม่งั้น local)
+    คืน dict: {doc_no: [{"time":, "date":, "amount":, "vendor":}, ...]} เรียงใหม่→เก่า"""
+    from collections import defaultdict
+    idx = defaultdict(list)
+
+    def _add(rows):
+        for r in rows:
+            items = r.get("items")
+            if isinstance(items, str):
+                try:
+                    items = json.loads(items)
+                except Exception:
+                    items = []
+            items = items or []
+            t = r.get("time") or r.get("timestamp") or ""
+            for it in items:
+                doc = str(it.get("doc") or "").strip()
+                if not doc:
+                    continue
+                idx[doc].append({
+                    "time": t,
+                    "date": str(it.get("date") or "")[:10],
+                    "amount": it.get("amount"),
+                    "vendor": it.get("vendor", ""),
+                })
+
+    cc = _cloud_cfg()
+    used_cloud = False
+    if cc.get("supabase_url") and cc.get("supabase_key"):
+        try:
+            import cloud_log
+            cloud_rows = cloud_log.fetch_queue_logs(cc, limit=limit)
+            if cloud_rows:
+                _add(cloud_rows)
+                used_cloud = True
+        except Exception:
+            pass
+    if not used_cloud:
+        _add(_load("kcash_queue_log.json"))
+
+    for doc in idx:
+        idx[doc].sort(key=lambda x: x.get("time", ""), reverse=True)
+    return dict(idx)
+
+
 def search(rows: list, query: str) -> list:
     """ค้นหาจาก วันที่ / ผู้ใช้ / action / รายละเอียด"""
     q = (query or "").strip().lower()

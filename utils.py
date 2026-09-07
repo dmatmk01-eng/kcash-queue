@@ -240,6 +240,74 @@ def distribute_into_days(expenses: list, limit: float, start=None) -> list:
     return assign_dates(groups, start)
 
 
+def _advance_business_days(start, n):
+    """เลื่อนไป n วันทำการจาก start"""
+    d = start
+    for _ in range(n):
+        d = _next_business_day(d)
+    return d
+
+
+def distribute_tiered(expenses: list, normal_limit: float,
+                      urgent_daily_limit: float = 20_000,
+                      small_pay_days: int = 7,
+                      urgent_pay_days: int = 2,
+                      start=None) -> dict:
+    """
+    กระจาย expense ออกเป็น 3 กอง:
+      normal  — >10k สะสม normal_limit/วัน
+      small   — ≤10k จ่ายใน small_pay_days วันทำการ
+      urgent  — manual เลือก ≤20k จ่ายใน urgent_pay_days วันทำการ (วงเงิน urgent_daily_limit/วัน)
+
+    Returns: {
+      "normal": [{"date": date, "items": [...]}, ...],
+      "small":  [{"date": date, "items": [...]}],
+      "urgent": [{"date": date, "items": [...]}, ...],
+    }
+    """
+    from expense_tiers import classify_expenses, TIER_NORMAL, TIER_SMALL, TIER_URGENT
+
+    classified = classify_expenses(expenses, amount_fn=_amount)
+
+    normal_groups = distribute_into_days(classified[TIER_NORMAL], normal_limit, start)
+
+    s = start or date.today()
+    weekly, hol = _holiday_config()
+    while _is_day_off(s, weekly, hol):
+        s = _next_business_day(s)
+
+    small_items = sorted(classified[TIER_SMALL], key=lambda e: _amount(e))
+    small_deadline = _advance_business_days(s, small_pay_days)
+    small_groups = [{"date": s, "items": small_items, "deadline": small_deadline}] if small_items else []
+
+    urgent_items = sorted(classified[TIER_URGENT], key=lambda e: _amount(e))
+    urgent_deadline = _advance_business_days(s, urgent_pay_days)
+    urgent_groups = []
+    if urgent_items:
+        u_limit = float(urgent_daily_limit or 20_000)
+        u_remaining = list(urgent_items)
+        u_day = s
+        while u_remaining:
+            day_items, total, rest = [], 0.0, []
+            for e in u_remaining:
+                amt = _amount(e)
+                if u_limit > 0 and day_items and (total + amt) > u_limit:
+                    rest.append(e)
+                    continue
+                day_items.append(e)
+                total += amt
+            if day_items:
+                urgent_groups.append({"date": u_day, "items": day_items, "deadline": urgent_deadline})
+            u_remaining = rest
+            u_day = _next_business_day(u_day)
+
+    return {
+        "normal": normal_groups,
+        "small": small_groups,
+        "urgent": urgent_groups,
+    }
+
+
 def assign_dates(groups: list, start=None) -> list:
     """ใส่วันที่ให้แต่ละกลุ่ม (ข้ามวันหยุด) — คืน [{'date': date, 'items': [...]}]"""
     result, d = [], (start or date.today())
@@ -274,15 +342,62 @@ def _exp_link(e: dict) -> str:
     return ""
 
 
+def _group_by_tier(items: list) -> tuple:
+    """แยกรายการออกเป็น 3 กลุ่ม: (normal, small, urgent)"""
+    normal, small, urgent = [], [], []
+    for e in items:
+        tag = e.get("_tier_tag", "")
+        if tag == "รายการด่วน":
+            urgent.append(e)
+        elif tag == "รายการย่อย":
+            small.append(e)
+        else:
+            normal.append(e)
+    return normal, small, urgent
+
+
+def _tier_summary(items: list) -> str:
+    """สร้างข้อความสรุปยอดแยก tier เช่น 'ปกติ 6 รายการ 150,000 | ย่อย 3 รายการ 5,000 | ด่วน 1 รายการ 1,007'"""
+    normal, small, urgent = _group_by_tier(items)
+    parts = []
+    if normal:
+        parts.append(f"ปกติ {len(normal)} รายการ {fmt_amount(sum(_amount(e) for e in normal))}")
+    if small:
+        parts.append(f"ย่อย {len(small)} รายการ {fmt_amount(sum(_amount(e) for e in small))}")
+    if urgent:
+        parts.append(f"ด่วน {len(urgent)} รายการ {fmt_amount(sum(_amount(e) for e in urgent))}")
+    return " | ".join(parts)
+
+
 def _exp_edit_link(e: dict) -> str:
     """ลิงก์หน้า 'แก้ไขเอกสาร' ใน FlowAccount (เปิดเพื่อแก้ไขใบ) — ข้อ 5"""
     sc  = e.get("_support_code") or ""
-    rid = e.get("recordId") or e.get("documentId") or ""
+    rid = e.get("documentId") or e.get("recordId") or ""
     if not (sc and rid):
         return ""
     seg = {"po": "purchase-orders", "gr": "purchases"}.get(
         e.get("_doctype", "expense"), "expenses")
     return f"https://advance.flowaccount.com/{sc}/business/{seg}/{rid}"
+
+
+def _tier_badge(e: dict) -> str:
+    tag = e.get("_tier_tag", "")
+    if tag == "รายการย่อย":
+        return "🔵 รายการย่อย"
+    if tag == "รายการด่วน":
+        return "🔴 รายการด่วน"
+    try:
+        import expense_tiers
+        amt = _amount(e)
+        tier = expense_tiers.get_tier(
+            str(e.get("recordId") or e.get("documentId") or e.get("id") or ""), amt)
+        if tier == expense_tiers.TIER_SMALL:
+            return "🔵 รายการย่อย"
+        if tier == expense_tiers.TIER_URGENT:
+            return "🔴 รายการด่วน"
+    except Exception:
+        pass
+    return ""
 
 
 def build_bank_excel_multiday(days: list, cfg: dict, path: str) -> None:
@@ -322,11 +437,15 @@ def build_bank_excel_multiday(days: list, cfg: dict, path: str) -> None:
         day_total = sum(_amount(e) for e in items)
         grand += day_total
         d = day["date"]
+        tier_info = _tier_summary(items)
         # หัววัน
         r += 1
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(headers))
-        cell = ws.cell(r, 1, f"📅 วันที่ {di}  ({thai[d.weekday()]} {fmt_date(d.isoformat())})"
-                             f"   —   {len(items)} รายการ   รวม {fmt_amount(day_total)} บาท")
+        day_label = (f"📅 วันที่ {di}  ({thai[d.weekday()]} {fmt_date(d.isoformat())})"
+                     f"   —   {len(items)} รายการ   รวม {fmt_amount(day_total)} บาท")
+        if tier_info:
+            day_label += f"   ({tier_info})"
+        cell = ws.cell(r, 1, day_label)
         cell.font = Font(name="Tahoma", size=11, bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="16A34A")
         cell.alignment = Alignment(horizontal="left", vertical="center")
@@ -338,38 +457,79 @@ def build_bank_excel_multiday(days: list, cfg: dict, path: str) -> None:
             hc.fill = PatternFill("solid", fgColor="DCFCE7")
             hc.alignment = Alignment(horizontal="center", vertical="center")
             hc.border = border
-        # รายการ
-        for i, e in enumerate(items, 1):
-            r += 1
-            row_vals = [i,
-                        fmt_date(e.get("dueDate") or e.get("due_date") or ""),
-                        _exp_brand(e), _doc_serial(e), _vendor_name(e),
-                        _exp_project(e), _amount(e), _vendor_account(e),
-                        _exp_remark(e), "", ""]
-            for col, val in enumerate(row_vals, 1):
-                cc = ws.cell(r, col, val)
-                cc.font = Font(name="Tahoma", size=10, color="0F172A")
-                cc.border = border
-                if col == 1:
-                    cc.alignment = Alignment(horizontal="center", vertical="center")
-                elif col == AMT_COL:
-                    cc.alignment = Alignment(horizontal="right", vertical="center")
-                    cc.number_format = "#,##0.00"
-                else:
-                    cc.alignment = Alignment(horizontal="left", vertical="center")
-            # คอลัมน์ลิงก์ — เปิดดูเอกสาร (ข้อ 1) + ลิงก์แก้ไขใบ (ข้อ 5)
-            link = _exp_link(e)
-            if link:
-                lc = ws.cell(r, len(headers) - 1)
-                lc.value = "เปิดดูเอกสาร"
-                lc.hyperlink = link
-                lc.font = Font(name="Tahoma", size=10, color="2563EB", underline="single")
-            edit = _exp_edit_link(e)
-            if edit:
-                ec = ws.cell(r, len(headers))
-                ec.value = "แก้ไขใบ"
-                ec.hyperlink = edit
-                ec.font = Font(name="Tahoma", size=10, color="DC2626", underline="single")
+        # จัดกลุ่มตาม tier
+        t_normal, t_small, t_urgent = _group_by_tier(items)
+        has_multi = sum(1 for g in (t_normal, t_small, t_urgent) if g) > 1
+        tier_groups = []
+        if t_normal:
+            if has_multi:
+                n_total = sum(_amount(e) for e in t_normal)
+                tier_groups.append(("🟢 รายการปกติ", t_normal,
+                    f"🟢 รายการปกติ — {len(t_normal)} รายการ • {fmt_amount(n_total)} บาท",
+                    ("DCFCE7", "15803D")))
+            else:
+                tier_groups.append(("", t_normal, None, None))
+        if t_small:
+            s_total = sum(_amount(e) for e in t_small)
+            tier_groups.append(("🔵 รายการย่อย", t_small,
+                f"🔵 รายการย่อย — {len(t_small)} รายการ • {fmt_amount(s_total)} บาท",
+                ("DBEAFE", "1D4ED8")))
+        if t_urgent:
+            u_total = sum(_amount(e) for e in t_urgent)
+            tier_groups.append(("🔴 รายการด่วน", t_urgent,
+                f"🔴 รายการด่วน — {len(t_urgent)} รายการ • {fmt_amount(u_total)} บาท",
+                ("FEE2E2", "DC2626")))
+        seq = 0
+        for tier_label, tier_items, sub_header, sub_colors in tier_groups:
+            if sub_header:
+                r += 1
+                ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(headers))
+                sc = ws.cell(r, 1, sub_header)
+                sc.font = Font(name="Tahoma", size=10, bold=True, italic=True,
+                               color=sub_colors[1])
+                sc.fill = PatternFill("solid", fgColor=sub_colors[0])
+                sc.alignment = Alignment(horizontal="left", vertical="center")
+            for e in tier_items:
+                seq += 1
+                r += 1
+                badge = _tier_badge(e)
+                date_val = fmt_date(e.get("dueDate") or e.get("due_date") or "")
+                if badge:
+                    date_val = f"{date_val}\n{badge}"
+                row_vals = [seq, date_val,
+                            _exp_brand(e), _doc_serial(e), _vendor_name(e),
+                            _exp_project(e), _amount(e), _vendor_account(e),
+                            _exp_remark(e), "", ""]
+                for col, val in enumerate(row_vals, 1):
+                    cc = ws.cell(r, col, val)
+                    cc.font = Font(name="Tahoma", size=10, color="0F172A")
+                    cc.border = border
+                    if col == 1:
+                        cc.alignment = Alignment(horizontal="center", vertical="center")
+                    elif col == 2 and badge:
+                        cc.alignment = Alignment(horizontal="center", vertical="center",
+                                                 wrap_text=True)
+                        if "ด่วน" in badge:
+                            cc.font = Font(name="Tahoma", size=10, color="DC2626")
+                        else:
+                            cc.font = Font(name="Tahoma", size=10, color="1D4ED8")
+                    elif col == AMT_COL:
+                        cc.alignment = Alignment(horizontal="right", vertical="center")
+                        cc.number_format = "#,##0.00"
+                    else:
+                        cc.alignment = Alignment(horizontal="left", vertical="center")
+                link = _exp_link(e)
+                if link:
+                    lc = ws.cell(r, len(headers) - 1)
+                    lc.value = "เปิดดูเอกสาร"
+                    lc.hyperlink = link
+                    lc.font = Font(name="Tahoma", size=10, color="2563EB", underline="single")
+                edit = _exp_edit_link(e)
+                if edit:
+                    ec = ws.cell(r, len(headers))
+                    ec.value = "แก้ไขใบ"
+                    ec.hyperlink = edit
+                    ec.font = Font(name="Tahoma", size=10, color="DC2626", underline="single")
         # ยอดรวมวัน
         r += 1
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=AMT_COL - 1)
@@ -455,6 +615,9 @@ def build_bank_pdf_multiday(days: list, cfg: dict, path: str) -> None:
     num_st = ParagraphStyle("num", parent=cell_st, alignment=1)
     grand = 0.0
 
+    tier_sub_st = ParagraphStyle("ts", parent=styles["Normal"], fontName=fname,
+                                  fontSize=9, textColor=colors.white)
+
     for di, day in enumerate(days, 1):
         items = day["items"]
         if not items:
@@ -462,9 +625,12 @@ def build_bank_pdf_multiday(days: list, cfg: dict, path: str) -> None:
         day_total = sum(_amount(e) for e in items)
         grand += day_total
         d = day["date"]
-        hdr = Table([[Paragraph(
-            f"วันที่ {di}  ({thai[d.weekday()]} {fmt_date(d.isoformat())})  —  "
-            f"{len(items)} รายการ   รวม {fmt_amount(day_total)} บาท", day_st)]],
+        tier_info = _tier_summary(items)
+        day_label = (f"วันที่ {di}  ({thai[d.weekday()]} {fmt_date(d.isoformat())})  —  "
+                     f"{len(items)} รายการ   รวม {fmt_amount(day_total)} บาท")
+        if tier_info:
+            day_label += f"   ({tier_info})"
+        hdr = Table([[Paragraph(day_label, day_st)]],
             colWidths=[sum(col_w)])
         hdr.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#16a34a")),
                                  ("LEFTPADDING", (0, 0), (-1, -1), 6),
@@ -474,41 +640,77 @@ def build_bank_pdf_multiday(days: list, cfg: dict, path: str) -> None:
 
         data = [[Paragraph(h, link_st if h in ("ลิงก์", "แก้ไขใบ") else cell_st)
                  for h in headers]]
-        for i, e in enumerate(items, 1):
-            link = _exp_link(e)
-            link_para = (Paragraph(f'<link href="{link}"><font color="#2563eb"><u>เปิดดู</u></font></link>',
-                                   link_st)
-                         if link else Paragraph("-", link_st))
-            edit = _exp_edit_link(e)
-            edit_para = (Paragraph(f'<link href="{edit}"><font color="#dc2626"><u>แก้ไข</u></font></link>',
-                                   link_st)
-                         if edit else Paragraph("-", link_st))
-            data.append([
-                Paragraph(str(i), num_st),
-                Paragraph(fmt_date(e.get("dueDate") or e.get("due_date") or ""), cell_st),
-                Paragraph(_exp_brand(e), cell_st),
-                Paragraph(_doc_serial(e), cell_st),
-                Paragraph(_vendor_name(e), cell_st),
-                Paragraph(_exp_project(e), cell_st),
-                Paragraph(fmt_amount(_amount(e)), cellr_st),
-                Paragraph(_vendor_account(e), cell_st),
-                Paragraph(_exp_remark(e), cell_st),
-                link_para,
-                edit_para,
-            ])
-        data.append([Paragraph("รวมวันนี้", cellr_st), "", "", "", "", "",
-                     Paragraph(fmt_amount(day_total), cellr_st), "", "", "", ""])
-        t = Table(data, colWidths=col_w, repeatRows=1)
-        t.setStyle(TableStyle([
+        style_cmds = [
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dcfce7")),
-            ("SPAN", (0, -1), (5, -1)),
-            ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#f1f5f9")),
             ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e1")),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            # ลดระยะขอบในเซลล์ → มีที่พอ เลขลำดับ/ข้อความไม่ตัดบรรทัดง่าย
             ("LEFTPADDING", (0, 0), (-1, -1), 3),
             ("RIGHTPADDING", (0, 0), (-1, -1), 3),
-        ]))
+        ]
+        t_normal, t_small, t_urgent = _group_by_tier(items)
+        has_multi = sum(1 for g in (t_normal, t_small, t_urgent) if g) > 1
+        tier_groups = []
+        if t_normal:
+            if has_multi:
+                n_total = sum(_amount(e) for e in t_normal)
+                tier_groups.append(("🟢 รายการปกติ", t_normal,
+                    f"🟢 รายการปกติ — {len(t_normal)} รายการ • {fmt_amount(n_total)} บาท",
+                    "#15803d"))
+            else:
+                tier_groups.append(("", t_normal, None, None))
+        if t_small:
+            s_total = sum(_amount(e) for e in t_small)
+            tier_groups.append(("🔵 รายการย่อย", t_small,
+                f"🔵 รายการย่อย — {len(t_small)} รายการ • {fmt_amount(s_total)} บาท",
+                "#1d4ed8"))
+        if t_urgent:
+            u_total = sum(_amount(e) for e in t_urgent)
+            tier_groups.append(("🔴 รายการด่วน", t_urgent,
+                f"🔴 รายการด่วน — {len(t_urgent)} รายการ • {fmt_amount(u_total)} บาท",
+                "#dc2626"))
+        seq = 0
+        for tier_label, tier_items, sub_hdr, sub_color in tier_groups:
+            if sub_hdr:
+                row_idx = len(data)
+                data.append([Paragraph(sub_hdr, tier_sub_st)] + [""] * (len(headers) - 1))
+                style_cmds.append(("SPAN", (0, row_idx), (-1, row_idx)))
+                style_cmds.append(("BACKGROUND", (0, row_idx), (-1, row_idx),
+                                   colors.HexColor(sub_color)))
+            for e in tier_items:
+                seq += 1
+                link = _exp_link(e)
+                link_para = (Paragraph(f'<link href="{link}"><font color="#2563eb"><u>เปิดดู</u></font></link>',
+                                       link_st)
+                             if link else Paragraph("-", link_st))
+                edit = _exp_edit_link(e)
+                edit_para = (Paragraph(f'<link href="{edit}"><font color="#dc2626"><u>แก้ไข</u></font></link>',
+                                       link_st)
+                             if edit else Paragraph("-", link_st))
+                badge = _tier_badge(e)
+                date_text = fmt_date(e.get("dueDate") or e.get("due_date") or "")
+                if badge:
+                    b_color = "#dc2626" if "ด่วน" in badge else "#1d4ed8"
+                    date_text += f'<br/><font color="{b_color}" size="7">{badge}</font>'
+                data.append([
+                    Paragraph(str(seq), num_st),
+                    Paragraph(date_text, cell_st),
+                    Paragraph(_exp_brand(e), cell_st),
+                    Paragraph(_doc_serial(e), cell_st),
+                    Paragraph(_vendor_name(e), cell_st),
+                    Paragraph(_exp_project(e), cell_st),
+                    Paragraph(fmt_amount(_amount(e)), cellr_st),
+                    Paragraph(_vendor_account(e), cell_st),
+                    Paragraph(_exp_remark(e), cell_st),
+                    link_para,
+                    edit_para,
+                ])
+        last_row = len(data)
+        data.append([Paragraph("รวมวันนี้", cellr_st), "", "", "", "", "",
+                     Paragraph(fmt_amount(day_total), cellr_st), "", "", "", ""])
+        style_cmds.append(("SPAN", (0, last_row), (5, last_row)))
+        style_cmds.append(("BACKGROUND", (0, last_row), (-1, last_row), colors.HexColor("#f1f5f9")))
+        t = Table(data, colWidths=col_w, repeatRows=1)
+        t.setStyle(TableStyle(style_cmds))
         elems.append(t)
         elems.append(Spacer(1, 8))
 
@@ -675,12 +877,17 @@ tr:nth-child(even) td{background:#f8fafc;}
        background:#dcfce7;padding:12px 16px;border-radius:8px;}
 a.lk{color:#2563eb;text-decoration:none;font-weight:600;}
 a.lk:hover{text-decoration:underline;}
+.badge-s{display:inline-block;background:#dbeafe;color:#1d4ed8;font-size:10px;font-weight:700;
+          padding:1px 6px;border-radius:8px;margin-top:2px;}
+.badge-u{display:inline-block;background:#fee2e2;color:#dc2626;font-size:10px;font-weight:700;
+          padding:1px 6px;border-radius:8px;margin-top:2px;}
 @media print{body{background:white;padding:0}.wrap{box-shadow:none}}
 </style></head><body><div class="wrap">"""]
     parts.append(f"<h1>คิวจ่ายเงิน (หลายวัน) — {company}</h1>")
     parts.append(f"<div class='sub'>วันที่ออกเอกสาร: {esc(fmt_date(today_str()))}</div>")
 
     grand = 0.0
+    ncols = len(headers)
     for di, day in enumerate(days, 1):
         items = day["items"]
         if not items:
@@ -688,33 +895,58 @@ a.lk:hover{text-decoration:underline;}
         day_total = sum(_amount(e) for e in items)
         grand += day_total
         d = day["date"]
+        tier_info = _tier_summary(items)
+        tier_part = f" &nbsp;({esc(tier_info)})" if tier_info else ""
         parts.append(
             f"<div class='daybar'>วันที่ {di} ({thai[d.weekday()]} {esc(fmt_date(d.isoformat()))}) "
-            f"— {len(items)} รายการ &nbsp;รวม {esc(fmt_amount(day_total))} บาท</div>")
+            f"— {len(items)} รายการ &nbsp;รวม {esc(fmt_amount(day_total))} บาท{tier_part}</div>")
         parts.append("<table><thead><tr>"
                      + "".join(f"<th>{esc(h)}</th>" for h in headers)
                      + "</tr></thead><tbody>")
-        for i, e in enumerate(items, 1):
-            link = _exp_link(e)
-            link_html = (f"<a class='lk' href='{esc(link)}' target='_blank'>เปิดดู</a>"
-                         if link else "-")
-            edit = _exp_edit_link(e)
-            edit_html = (f"<a class='lk' style='color:#dc2626' href='{esc(edit)}' "
-                         f"target='_blank'>แก้ไขใบ</a>" if edit else "-")
-            parts.append(
-                "<tr>"
-                f"<td class='ctr'>{i}</td>"
-                f"<td class='ctr'>{esc(fmt_date(e.get('dueDate') or e.get('due_date') or ''))}</td>"
-                f"<td>{esc(_exp_brand(e))}</td>"
-                f"<td>{esc(_doc_serial(e))}</td>"
-                f"<td>{esc(_vendor_name(e))}</td>"
-                f"<td>{esc(_exp_project(e))}</td>"
-                f"<td class='amt'>{esc(fmt_amount(_amount(e)))}</td>"
-                f"<td>{esc(_vendor_account(e))}</td>"
-                f"<td>{esc(_exp_remark(e))}</td>"
-                f"<td class='ctr'>{link_html}</td>"
-                f"<td class='ctr'>{edit_html}</td>"
-                "</tr>")
+        normal, small, urgent = _group_by_tier(items)
+        has_multi = sum(1 for g in (normal, small, urgent) if g) > 1
+        seq = 0
+        for group, label, bg_color in [
+            (normal, "รายการปกติ" if has_multi else None, "#dcfce7"),
+            (small, "รายการย่อย", "#dbeafe"),
+            (urgent, "รายการด่วน", "#fee2e2"),
+        ]:
+            if not group:
+                continue
+            if label:
+                grp_total = sum(_amount(e) for e in group)
+                parts.append(
+                    f"<tr><td colspan='{ncols}' style='background:{bg_color};"
+                    f"font-weight:700;font-style:italic;padding:6px 14px;'>"
+                    f"▸ {esc(label)} ({len(group)} รายการ รวม {esc(fmt_amount(grp_total))} บาท)"
+                    f"</td></tr>")
+            for e in group:
+                seq += 1
+                link = _exp_link(e)
+                link_html = (f"<a class='lk' href='{esc(link)}' target='_blank'>เปิดดู</a>"
+                             if link else "-")
+                edit = _exp_edit_link(e)
+                edit_html = (f"<a class='lk' style='color:#dc2626' href='{esc(edit)}' "
+                             f"target='_blank'>แก้ไขใบ</a>" if edit else "-")
+                badge = _tier_badge(e)
+                badge_html = ""
+                if badge:
+                    cls = "badge-u" if "ด่วน" in badge else "badge-s"
+                    badge_html = f"<br><span class='{cls}'>{esc(badge)}</span>"
+                parts.append(
+                    "<tr>"
+                    f"<td class='ctr'>{seq}</td>"
+                    f"<td class='ctr'>{esc(fmt_date(e.get('dueDate') or e.get('due_date') or ''))}{badge_html}</td>"
+                    f"<td>{esc(_exp_brand(e))}</td>"
+                    f"<td>{esc(_doc_serial(e))}</td>"
+                    f"<td>{esc(_vendor_name(e))}</td>"
+                    f"<td>{esc(_exp_project(e))}</td>"
+                    f"<td class='amt'>{esc(fmt_amount(_amount(e)))}</td>"
+                    f"<td>{esc(_vendor_account(e))}</td>"
+                    f"<td>{esc(_exp_remark(e))}</td>"
+                    f"<td class='ctr'>{link_html}</td>"
+                    f"<td class='ctr'>{edit_html}</td>"
+                    "</tr>")
         parts.append(
             f"<tr class='daytotal'><td colspan='6' style='text-align:right'>รวมวันที่ {di}</td>"
             f"<td class='amt'>{esc(fmt_amount(day_total))}</td><td colspan='4'></td></tr>")
