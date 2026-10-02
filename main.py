@@ -507,12 +507,23 @@ class RejectFlowAccountWorker(QThread):
 # ──────────────────── Dialogs ────────────────────
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, restricted=False):
         super().__init__(parent)
-        self.setWindowTitle("⚙️ ตั้งค่า")
+        self.restricted = restricted   # True = แก้ได้เฉพาะ 'จำนวนรายการที่ดึง' (ผู้ใช้ที่ไม่ใช่ dev)
+        self.setWindowTitle("⚙️ ตั้งค่า" + (" (แก้ไขได้เฉพาะจำนวนรายการที่ดึง)" if restricted else ""))
         self.setMinimumWidth(520)
         self.cfg = load_config()
         self._build_ui()
+        if restricted:
+            self._lock_all_but_fetch_limit()
+
+    def _lock_all_but_fetch_limit(self):
+        """ล็อกทุกช่อง ยกเว้นจำนวนรายการที่ดึง + ซ่อนค่า key ไม่ให้เห็น"""
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        keep = self.ed_fetch_limit
+        for w in self.findChildren(QWidget):
+            if isinstance(w, (QLineEdit, QTextEdit, QCheckBox, QComboBox)) and w is not keep:
+                w.setEnabled(False)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -661,6 +672,15 @@ class SettingsDialog(QDialog):
         layout.addWidget(btns)
 
     def _save(self):
+        if self.restricted:
+            # ผู้ใช้ทั่วไป: บันทึกเฉพาะจำนวนรายการที่ดึง (ที่เหลือไม่แตะ)
+            try:
+                self.cfg["fetch_limit"] = max(200, int(self.ed_fetch_limit.text().replace(",", "").strip()))
+            except Exception:
+                self.cfg["fetch_limit"] = 1000
+            save_config(self.cfg)
+            self.accept()
+            return
         self.cfg["flowaccount_api_key"]    = self.api_key.text().strip()
         self.cfg["flowaccount_secret_key"] = self.secret_key.text().strip()
         try:
@@ -9472,7 +9492,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.5"
+APP_VERSION = "4.5.1"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -9604,6 +9624,16 @@ QToolTip { background-color: #2a2b2e; color: #e8eaed; border: 1px solid #5f6368;
 """
 
 CHANGELOG = [
+    {
+        "version": "4.5.1",
+        "date": "02/10/2569",
+        "title": "ผู้ใช้ทุกคนปรับจำนวนรายการที่ดึงได้",
+        "items": [
+            "เมนู ไฟล์ → ตั้งค่า: ผู้ใช้ทุกสิทธิ์เปิดดูได้ และปรับ 'จำนวนรายการที่ดึง (ล่าสุด)' ได้",
+            "ช่องอื่นในหน้าตั้งค่าถูกล็อกไว้ (แก้ได้เฉพาะ Dev) และค่า API Key ถูกซ่อน",
+            "เพิ่มจำนวนที่ดึงเพื่อให้หาใบเอกสารเก่าในหน้าจัดคิวเจอ",
+        ],
+    },
     {
         "version": "4.5",
         "date": "07/09/2569",
@@ -10258,12 +10288,11 @@ class MainWindow(QMainWindow):
         role = self.current_user.get("role", "user")
         menubar = self.menuBar()
         file_menu = menubar.addMenu("ไฟล์")
-        # ⚙️ ตั้งค่า — เฉพาะ dev เท่านั้น (admin/user มองไม่เห็นและแก้ไม่ได้)
-        if role == "dev":
-            act_settings = QAction("⚙️ ตั้งค่า", self)
-            act_settings.triggered.connect(self._open_settings)
-            file_menu.addAction(act_settings)
-            file_menu.addSeparator()
+        # ⚙️ ตั้งค่า — dev แก้ได้ทั้งหมด / admin+user เห็นแต่แก้ได้เฉพาะจำนวนรายการที่ดึง
+        act_settings = QAction("⚙️ ตั้งค่า", self)
+        act_settings.triggered.connect(self._open_settings)
+        file_menu.addAction(act_settings)
+        file_menu.addSeparator()
         act_clear_links = QAction("🧹 ล้างลิงก์ Export เก่าทั้งหมด", self)
         act_clear_links.triggered.connect(self._clear_export_links)
         file_menu.addAction(act_clear_links)
@@ -10642,11 +10671,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(300, self.queue_tab.fetch_expenses)
 
     def _open_settings(self):
-        if self.current_user.get("role", "user") != "dev":
-            QMessageBox.warning(self, "ไม่มีสิทธิ์",
-                "การตั้งค่าแก้ไขได้เฉพาะ Dev เท่านั้น")
-            return
-        dlg = SettingsDialog(self)
+        restricted = self.current_user.get("role", "user") != "dev"
+        dlg = SettingsDialog(self, restricted=restricted)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.status.showMessage("บันทึกการตั้งค่าแล้ว — กำลังดึงข้อมูลใหม่...")
             self.queue_tab.fetch_expenses()
