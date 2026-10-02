@@ -233,6 +233,13 @@ def _payment_date(e: dict) -> str:
     return ""
 
 
+def _is_paid(e: dict) -> bool:
+    """จ่ายแล้วจริงไหม — ครอบทุกสถานะที่ FlowAccount ใช้ (paid, paidByPaymentSlip ฯลฯ)
+    ตรงกับที่คอลัมน์สถานะโชว์ (_status_category) ไม่ให้ใบที่จ่ายแล้วหลุดเข้าคิว"""
+    st = _status(e)
+    return ("paid" in st and "unpaid" not in st) or bool(_payment_date(e))
+
+
 def _share_link(e: dict) -> str:
     """สร้างลิงก์ไปหน้าเอกสารใน FlowAccount (ข้อมูลเพิ่มเติมของรายการ)"""
     sc  = e.get("_support_code") or ""
@@ -1611,7 +1618,7 @@ class QueuePlanDialog(QDialog):
         in_ids = {_exp_id(e) for grp in self._days for e in grp}
         avail = [e for e in pool
                  if _exp_id(e) not in in_ids and _amount(e) > 0
-                 and _status(e) != "paid"
+                 and not _is_paid(e)
                  and not paid_pending.is_pending(_exp_id(e))
                  and not rejected.is_rejected(_exp_id(e))]
         if not avail:
@@ -4840,7 +4847,7 @@ class QueueTab(QWidget):
                 "กรุณากด 🔄 รีเฟรช เพื่อดึงข้อมูลก่อนครับ")
             return
 
-        candidates = [e for e in self._expenses if _status(e) != "paid" and _amount(e) > 0
+        candidates = [e for e in self._expenses if not _is_paid(e) and _amount(e) > 0
                       and not paid_pending.is_pending(_exp_id(e))
                       and not rejected.is_rejected(_exp_id(e))]
         if not candidates:
@@ -4999,7 +5006,7 @@ class QueueTab(QWidget):
             QMessageBox.information(self, "ยังไม่มีข้อมูล",
                 "กรุณากด 🔄 รีเฟรช เพื่อดึงข้อมูลก่อนครับ")
             return
-        candidates = [e for e in self._expenses if _status(e) != "paid"
+        candidates = [e for e in self._expenses if not _is_paid(e)
                       and _amount(e) > 0 and not paid_pending.is_pending(_exp_id(e))
                       and not rejected.is_rejected(_exp_id(e))]
         if not candidates:
@@ -5328,7 +5335,7 @@ class QueueTab(QWidget):
             to_sync = [e for e in self._expenses if _exp_id(e) in self._selected]
             detail  = f"Sync {len(to_sync)} รายการที่เลือก"
         else:
-            to_sync = [e for e in self._expenses if _status(e) != "paid"]
+            to_sync = [e for e in self._expenses if not _is_paid(e)]
             skipped = len(self._expenses) - len(to_sync)
             detail  = f"Sync {len(to_sync)} รายการที่ยังไม่จ่าย\n(ข้าม {skipped} รายการที่จ่ายแล้ว เพื่อประหยัด API)"
         if not to_sync:
@@ -5554,7 +5561,7 @@ class QueueTab(QWidget):
         assignments = load_brands()
         # ใช้ทั้งหมดที่ยังไม่จ่าย (ไม่รวมที่ Mark รออัพเดต) เพื่อให้ตรงกับตารางคิว
         pool = [e for e in self._expenses
-                if _status(e) != "paid" and _amount(e) > 0
+                if not _is_paid(e) and _amount(e) > 0
                 and not paid_pending.is_pending(_exp_id(e))]
         if not pool:
             QMessageBox.information(self, "ไม่มีรายการ",
@@ -9492,7 +9499,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.5.1"
+APP_VERSION = "4.5.2"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -9624,6 +9631,16 @@ QToolTip { background-color: #2a2b2e; color: #e8eaed; border: 1px solid #5f6368;
 """
 
 CHANGELOG = [
+    {
+        "version": "4.5.2",
+        "date": "02/10/2569",
+        "title": "แก้บิลที่จ่ายแล้วหลุดเข้าคิวจัดจ่าย",
+        "items": [
+            "แก้บั๊ก: บิลที่ FlowAccount ขึ้น 'ชำระเงินแล้ว' แบบแนบสลิป (paidByPaymentSlip) เคยหลุดเข้าตารางคิว/จัดคิวอัตโนมัติ/เพิ่มเข้าคิว",
+            "ตอนนี้ทุกสถานะที่เป็นจ่ายแล้วจะไม่ถูกนำมาจัดคิว ตรงกับคอลัมน์สถานะในตาราง",
+            "Sync monday.com / Export ก็ไม่นับบิลที่จ่ายแล้วเช่นกัน",
+        ],
+    },
     {
         "version": "4.5.1",
         "date": "02/10/2569",
@@ -10462,7 +10479,7 @@ class MainWindow(QMainWindow):
         assignments = _la()
         unpaid = []
         for e in expenses:
-            if _status(e) == "paid":
+            if _is_paid(e):
                 continue
             ec = dict(e)
             ec["_brand_name"] = _brand_name(e, assignments)
