@@ -330,12 +330,20 @@ def _date_distance(slip, exp) -> int:
     """ระยะห่างวัน (วันจ่ายในสลิป vs วันที่/ครบกำหนดของเอกสาร) — ใช้เป็นตัวช่วยตัดสิน"""
     from datetime import date as _d
     sd = (slip.get("pay_date") or "")[:10]
-    ed = (exp.get("publishedOn") or exp.get("dueDate") or exp.get("createdDate") or "")[:10]
     try:
-        a = _d.fromisoformat(sd); b = _d.fromisoformat(ed)
-        return abs((a - b).days)
+        a = _d.fromisoformat(sd)
     except Exception:
         return 9999
+    # วันที่ของเอกสารที่ 'ใกล้วันโอนที่สุด' — ดูทั้งวันครบกำหนด/วันที่ออกเอกสาร
+    # (บิลมักถูกจ่ายใกล้วันครบกำหนด หรือไม่ก็ไม่นานหลังออกบิล)
+    best = 9999
+    for k in ("dueDate", "publishedOn", "createdDate"):
+        ed = (exp.get(k) or "")[:10]
+        try:
+            best = min(best, abs((a - _d.fromisoformat(ed)).days))
+        except Exception:
+            continue
+    return best
 
 
 def _exp_amount(e: dict) -> float:
@@ -614,8 +622,10 @@ def match_slip_to_expenses(slip_records: list, expenses: list,
                             "score": 1.0, "status": "matched", "via": "account"})
             continue
 
-        # 1) ยอดตรง + ชื่อคล้าย (เทียบชื่อผู้จำหน่าย และค้นในรายละเอียด)
-        cands = []
+        # 1) ยอดตรง + ชื่อคล้าย + วันที่ใกล้ (เทียบชื่อผู้จำหน่าย และค้นในรายละเอียด)
+        #    หลักคิด: ยอดต้องตรง → ชื่อยืนยันว่าเป็นคนเดียวกัน
+        #    → ถ้ายอดเท่ากันหลายใบ (ชื่อแยกไม่ออก) ให้ 'วันที่' ใกล้วันโอนที่สุดเป็นตัวตัดสินหลัก
+        cands = []        # (คะแนนชื่อ, ห่างกี่วัน, index, expense)
         for i, e in enumerate(expenses):
             if i in used or abs(_exp_amount(e) - amt) > amount_tol:
                 continue
@@ -623,34 +633,58 @@ def match_slip_to_expenses(slip_records: list, expenses: list,
             if s_tokens:
                 hit = sum(1 for t in s_tokens if len(t) >= 2 and t in blobs[i])
                 score = max(score, hit / len(s_tokens))
-            cands.append((score, -_date_distance(s, e), i, e))
-        cands.sort(reverse=True)
-        if cands and cands[0][0] >= name_threshold:
-            best_score, _, bi, be = cands[0]
-            # กันยอดชนกัน: ถ้ามีเอกสาร 'ยอดเท่ากัน' หลายใบ และคะแนนชื่อของอันดับ 2
-            # ไล่จี้มา (ต่างกัน < 0.2) = ไม่ชัวร์ว่าใบไหน → ห้ามเดา ให้เป็น 'ต้องยืนยัน'
-            second = cands[1][0] if len(cands) > 1 else -1.0
-            ambiguous = len(cands) >= 2 and (best_score - second) < 0.2
-            if ambiguous:
-                used.add(bi)
-                results.append({"slip": s, "expense": be,
-                                "score": round(best_score, 2), "status": "amount_only",
-                                "match_note": f"ยอดเท่ากัน {len(cands)} ใบ — ต้องเลือกใบให้ถูก"})
+            cands.append((score, _date_distance(s, e), i, e))
+        n_amt = len(cands)          # จำนวนเอกสารที่ 'ยอดตรง'
+        # เฉพาะที่วันที่ใกล้ (<=60 วัน หรือไม่รู้วันที่) ถึงจะเตือนให้เลือกเอง — กันเตือนมั่วกับบิลเก่าที่ยอดบังเอิญซ้ำ
+        n_near = sum(1 for c in cands if c[1] <= 60 or c[1] == 9999)
+
+        def _day_txt(dd):
+            return f"ห่าง {dd} วัน" if dd < 9999 else "ไม่ทราบวันที่"
+
+        if cands:
+            best_c = max(cands, key=lambda c: (c[0], -c[1]))
+            if best_c[0] >= name_threshold:
+                # คู่แข่ง = เอกสารยอดเท่ากันที่ชื่อ 'ไล่จี้' (ต่างกัน < 0.2) — ถ้าไม่มี = ชื่อชัด → เขียว
+                close = [c for c in cands if best_c[0] - c[0] < 0.2]      # รวมตัวมันเอง
+                if len(close) == 1:
+                    bi, be = best_c[2], best_c[3]
+                    used.add(bi)
+                    _learn_green(s, be)
+                    results.append({"slip": s, "expense": be,
+                                    "score": round(best_c[0], 2), "status": "matched",
+                                    "amount_match_n": n_near})
+                    continue
+                # ชื่อใกล้กันหลายใบ → ดู 'วันที่' เป็นหลัก
+                by_date = sorted(close, key=lambda c: (c[1], -c[0]))
+                d0 = by_date[0]
+                gap = by_date[1][1] - d0[1]
+                if d0[0] >= name_threshold and gap >= 2 and d0[1] < 9999:
+                    used.add(d0[2])
+                    _learn_green(s, d0[3])
+                    results.append({"slip": s, "expense": d0[3],
+                                    "score": round(d0[0], 2), "status": "matched",
+                                    "via": "date", "amount_match_n": n_near,
+                                    "match_note": (f"ยอดเท่ากัน {len(close)} ใบ — เลือกใบที่วันที่ใกล้สุด "
+                                                   f"({_day_txt(d0[1])})")})
+                    continue
+                # วันที่ก็แยกไม่ออก → ห้ามเดา เหลืองให้ยืนยัน (เสนอใบที่วันที่ใกล้สุดไว้ก่อน)
+                used.add(d0[2])
+                results.append({"slip": s, "expense": d0[3],
+                                "score": round(d0[0], 2), "status": "amount_only",
+                                "amount_match_n": n_near,
+                                "match_note": f"ยอดเท่ากัน {len(close)} ใบ — ต้องเลือกใบให้ถูก"})
                 continue
-            used.add(bi)
-            _learn_green(s, be)
-            results.append({"slip": s, "expense": be,
-                            "score": round(best_score, 2), "status": "matched"})
-            continue
-        if cands and cands[0][0] >= maybe_threshold:
-            best_score, _, bi, be = cands[0]
-            used.add(bi)
-            note = (f"ยอดเท่ากัน {len(cands)} ใบ — ต้องเลือกใบให้ถูก"
-                    if len(cands) >= 2 else "ยอดตรงแต่ชื่อไม่ชัด — ต้องยืนยัน")
-            results.append({"slip": s, "expense": be,
-                            "score": round(best_score, 2), "status": "amount_only",
-                            "match_note": note})
-            continue
+            if best_c[0] >= maybe_threshold:
+                plaus = sorted([c for c in cands if c[0] >= maybe_threshold],
+                               key=lambda c: (c[1], -c[0]))          # วันที่ใกล้สุดก่อน
+                d0 = plaus[0]
+                used.add(d0[2])
+                note = (f"ยอดเท่ากัน {n_amt} ใบ — ต้องเลือกใบให้ถูก"
+                        if n_amt >= 2 else "ยอดตรงแต่ชื่อไม่ชัด — ต้องยืนยัน")
+                results.append({"slip": s, "expense": d0[3],
+                                "score": round(d0[0], 2), "status": "amount_only",
+                                "amount_match_n": n_near, "match_note": note})
+                continue
 
         # 1.5) ยอดรวมไม่ตรง แต่ "ชื่อตรง" + ยอดตรงกับ (ก)บรรทัดย่อยในเอกสาร
         #      หรือ (ข)ยอดหลังหัก ณ ที่จ่าย → ถือว่าเจอคู่ (เขียว) เพราะมี 2 สัญญาณ
@@ -703,12 +737,21 @@ def match_slip_to_expenses(slip_records: list, expenses: list,
                     if key > best_key:
                         best_key = key; best = e
             if best is not None:
-                results.append({"slip": s, "expense": best,
-                                "score": 0.9, "status": "amount_only"})
+                rec2 = {"slip": s, "expense": best, "score": 0.9, "status": "amount_only"}
+                if n_near:
+                    rec2["amount_match_n"] = n_near
+                    rec2["match_note"] = (f"⚠️ ยอดตรงกับ {n_near} ใบ แต่ชื่อไม่ตรง — กดเลือกใบเอง "
+                                          "(ตัวเดาในตารางมาจากชื่อในรายละเอียดเอกสาร ยอดไม่ตรง)")
+                results.append(rec2)
                 continue
 
-        results.append({"slip": s, "expense": None, "score": None,
-                        "status": "unmatched"})
+        # ไม่มีใบไหนที่ชื่อพอ แต่ 'ยอดตรง' กับเอกสาร n ใบ → เตือน + ให้ผู้ใช้กดเลือกใบเอง
+        # (ไม่เดาเอง เพราะชื่อไม่ตรง — แต่แจ้งให้รู้ว่ามีใบที่ยอดตรง พร้อมเรียงตามวันที่ใกล้สุด)
+        rec = {"slip": s, "expense": None, "score": None, "status": "unmatched"}
+        if n_near:
+            rec["amount_match_n"] = n_near
+            rec["match_note"] = f"⚠️ ยอดตรงกับ {n_near} ใบ แต่ชื่อไม่ตรง — กดเลือกใบเอง"
+        results.append(rec)
 
     # ── รอบสอง: ใช้เลขบัญชีที่ "เพิ่งเรียนรู้" จากคู่สีเขียวในรอบนี้
     #    มาช่วยแถวที่ยังไม่เจอ/น่าจะใช่ ในไฟล์เดียวกัน (ทันทีไม่ต้องรอรอบหน้า)

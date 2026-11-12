@@ -50,7 +50,8 @@ from utils import (build_bank_csv, build_bank_excel, build_line_message,
                    _group_by_tier, _tier_summary)
 from manual_expenses import load_manual, add_manual, delete_manual, update_manual, is_manual
 from brand_assignments import load_assignments as load_brands, save_assignments as save_brands, get_brand, set_brand
-from bank_slip import parse_payment_report, match_slip_to_expenses, _exp_serial as _slip_exp_serial
+from bank_slip import (parse_payment_report, match_slip_to_expenses,
+                       _exp_serial as _slip_exp_serial, _date_distance as _slip_date_dist)
 import activity_log
 import paid_pending
 import queue_plan
@@ -6707,60 +6708,112 @@ class MatchExpenseFetchWorker(QThread):
 
 
 class SlipManualMatchDialog(QDialog):
-    """จับคู่สลิปกับค่าใช้จ่ายเอง — ค้นหา + เลือก expense"""
+    """จับคู่สลิปกับค่าใช้จ่ายเอง — โชว์เอกสาร 'ยอดตรง' ก่อน เรียงตามวันที่ใกล้วันโอนที่สุด
+    (ชื่อในสลิปอาจไม่ตรงกับชื่อในระบบ → ผู้ใช้ดูวันที่/ชื่อแล้วเลือกใบที่ถูกเอง)"""
+    COLS = ["เลขเอกสาร", "ผู้รับเงิน / Vendor", "ยอด (บาท)", "วันที่เอกสาร", "ครบกำหนด", "ห่างจากวันโอน"]
+
     def __init__(self, slip, expenses, parent=None):
         super().__init__(parent)
         self.setWindowTitle("จับคู่ค่าใช้จ่ายเอง")
-        self.resize(620, 480)
+        self.resize(780, 540)
         self.expenses = expenses
         self.picked = None
+        self._slip = slip
         amt = slip.get("amount") or 0
+        self._amt = amt
 
         lay = QVBoxLayout(self)
+        when = fmt_date(slip.get("pay_date", "")) or "-"
+        if slip.get("pay_time"):
+            when += f" {slip['pay_time']} น."
         lay.addWidget(QLabel(
-            f"<b>สลิป:</b> {slip.get('recv_name','')} • "
-            f"<b>{fmt_amount(amt)} บาท</b> • วันที่ {fmt_date(slip.get('pay_date','')) or '-'}"))
+            f"<b>สลิป:</b> {slip.get('recv_name','') or '(อ่านชื่อไม่ได้)'} • "
+            f"<b>{fmt_amount(amt)} บาท</b> • วันที่ {when}"))
 
+        # แถบแจ้งเตือน: ยอดตรงกี่ใบ
+        self._eq = [e for e in expenses if abs(_amount(e) - amt) <= 0.01]
+        if self._eq:
+            warn = QLabel(f"⚠️ พบเอกสารที่ <b>ยอดตรง {len(self._eq)} ใบ</b> — เรียงตามวันที่ใกล้วันโอนที่สุด "
+                          "กรุณาเช็คชื่อ/วันที่แล้วเลือกใบที่ถูกต้อง")
+            warn.setStyleSheet("background:#ffedd5;color:#9a3412;border-radius:4px;padding:5px 10px;")
+        else:
+            warn = QLabel("ไม่พบเอกสารที่ยอดตรงกับสลิปนี้ — ค้นหาจากชื่อ/เลขเอกสารด้านล่าง")
+            warn.setStyleSheet("background:#fee2e2;color:#991b1b;border-radius:4px;padding:5px 10px;")
+        warn.setWordWrap(True)
+        lay.addWidget(warn)
+
+        row = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText("🔍 ค้นหา ชื่อผู้รับ / เลขเอกสาร / ยอดเงิน")
-        self.search.textChanged.connect(self._filter)
-        lay.addWidget(self.search)
+        self.search.textChanged.connect(self._refill)
+        row.addWidget(self.search, 1)
+        self.chk_eq = QCheckBox("แสดงเฉพาะยอดตรง")
+        self.chk_eq.setChecked(bool(self._eq))
+        self.chk_eq.setEnabled(bool(self._eq))
+        self.chk_eq.stateChanged.connect(lambda *_: self._refill())
+        row.addWidget(self.chk_eq)
+        lay.addLayout(row)
 
-        self.listw = QListWidget()
-        self.listw.itemDoubleClicked.connect(lambda *_: self._ok())
-        lay.addWidget(self.listw, 1)
+        self.tbl = QTableWidget(0, len(self.COLS))
+        self.tbl.setHorizontalHeaderLabels(self.COLS)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        hh = self.tbl.horizontalHeader()
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for c, w in ((0, 120), (2, 100), (3, 90), (4, 90), (5, 110)):
+            self.tbl.setColumnWidth(c, w)
+        self.tbl.cellDoubleClicked.connect(lambda *_: self._ok())
+        lay.addWidget(self.tbl, 1)
 
-        # เรียงให้ "ยอดตรง" ขึ้นก่อน
+        # เรียง: ยอดตรงก่อน (วันที่ใกล้สุดก่อน) → ที่เหลือเรียงตามยอดต่าง/วันที่
         def sort_key(e):
-            return (abs(_amount(e) - amt) > 0.01, abs(_amount(e) - amt))
+            diff = abs(_amount(e) - amt)
+            return (diff > 0.01, _slip_date_dist(slip, e) if diff <= 0.01 else diff,
+                    _slip_date_dist(slip, e))
         self._sorted = sorted(expenses, key=sort_key)
-        self._fill(self._sorted)
+        self._cur = []
+        self._refill()
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self._ok); bb.rejected.connect(self.reject)
         lay.addWidget(bb)
 
-    def _fill(self, items):
-        self.listw.clear()
-        self._cur = items
-        for e in items[:400]:
-            txt = f"{_doc_no(e)}  |  {_vendor(e) or '-'}  |  {fmt_amount(_amount(e))} บาท"
-            it = QListWidgetItem(txt)
-            self.listw.addItem(it)
-
-    def _filter(self, q):
-        q = (q or "").strip().lower()
-        if not q:
-            self._fill(self._sorted); return
-        out = [e for e in self._sorted if
-               q in (_vendor(e) or "").lower() or
-               q in (_doc_no(e) or "").lower() or
-               q in f"{_amount(e):.2f}"]
-        self._fill(out)
+    def _refill(self, *_):
+        q = (self.search.text() or "").strip().lower()
+        items = self._sorted
+        if self.chk_eq.isChecked() and self._eq:
+            items = [e for e in items if abs(_amount(e) - self._amt) <= 0.01]
+        if q:
+            items = [e for e in items if
+                     q in (_vendor(e) or "").lower() or
+                     q in (_doc_no(e) or "").lower() or
+                     q in f"{_amount(e):.2f}"]
+        self._cur = items[:400]
+        self.tbl.setRowCount(0)
+        for e in self._cur:
+            r = self.tbl.rowCount()
+            self.tbl.insertRow(r)
+            dd = _slip_date_dist(self._slip, e)
+            is_eq = abs(_amount(e) - self._amt) <= 0.01
+            vals = [_doc_no(e), _vendor(e) or "-", fmt_amount(_amount(e)),
+                    fmt_date((e.get("publishedOn") or "")[:10]) if e.get("publishedOn") else "-",
+                    fmt_date(_due(e)[:10]) if _due(e) else "-",
+                    (f"{dd} วัน" if dd < 9999 else "-")]
+            for c, v in enumerate(vals):
+                it = QTableWidgetItem(v)
+                if c == 2:
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if is_eq:
+                    it.setBackground(QBrush(C_MATCHED if dd <= 7 else C_DUE_SOON))
+                self.tbl.setItem(r, c, it)
+        if self._cur:
+            self.tbl.selectRow(0)
 
     def _ok(self):
-        i = self.listw.currentRow()
-        if 0 <= i < len(self._cur[:400]):
+        i = self.tbl.currentRow()
+        if 0 <= i < len(self._cur):
             self.picked = self._cur[i]
             self.accept()
 
@@ -6774,13 +6827,14 @@ class SlipMatchTab(QWidget):
     status_message = pyqtSignal(str)
 
     COLS = ["✓", "#", "วันที่จ่าย", "ชื่อผู้รับ (สลิป)", "ยอด (บาท)",
-            "จับคู่กับ EXP", "ชื่อในระบบ", "แบรนด์", "คะแนน", "สถานะ", "ดูใน FlowAccount", "รูป"]
+            "จับคู่กับ EXP", "ชื่อในระบบ", "แบรนด์", "คะแนน", "สถานะ", "ดูใน FlowAccount", "รูป",
+            "เลือกใบเอง"]
     # หน้า "ไม่เจอคู่" — รวม "ไม่เจอ" + "น่าจะใช่" (ยังไม่ชัวร์ ต้องตรวจ)
     # โชว์รายละเอียดในสลิป + EXP ที่ระบบเดา เพื่อช่วยยืนยัน/ลงเอกสาร
     # คอลัมน์แรก ✓ = ติ๊กเลือกเพื่อนำกลับเข้าหน้า "จับคู่สำเร็จเตรียมดำเนินการต่อ"
     COLS_UN = ["✓", "#", "วันที่จ่าย", "ชื่อผู้รับ (สลิป)", "ยอด (บาท)",
                "รายละเอียดในสลิป (เลขบิล/บันทึก)", "EXP ที่ระบบเดา",
-               "ชื่อในระบบ", "สถานะ", "ดูใน FlowAccount", "รูป"]
+               "ชื่อในระบบ", "สถานะ", "ดูใน FlowAccount", "รูป", "เลือกใบเอง"]
 
     def __init__(self):
         super().__init__()
@@ -6916,9 +6970,10 @@ class SlipMatchTab(QWidget):
         self.table_un.setColumnWidth(5, 220)   # รายละเอียด
         self.table_un.setColumnWidth(6, 120)   # EXP ที่ระบบเดา
         self.table_un.setColumnWidth(7, 200)   # ชื่อในระบบ
-        self.table_un.setColumnWidth(8, 140)   # สถานะ
+        self.table_un.setColumnWidth(8, 200)   # สถานะ (กว้างไว้โชว์คำเตือนยอดตรง)
         self.table_un.setColumnWidth(9, 130)   # ดูใน FlowAccount
         self.table_un.setColumnWidth(10, 80)   # รูป
+        self.table_un.setColumnWidth(11, 130)  # เลือกใบเอง
         self.table_un.verticalHeader().setVisible(False)
         self.table_un.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table_un.setStyleSheet("QTableWidget{border:1px solid #fecaca;font-size:12px;}")
@@ -6948,9 +7003,10 @@ class SlipMatchTab(QWidget):
         t.setColumnWidth(6, 200)   # ชื่อในระบบ
         t.setColumnWidth(7, 110)   # แบรนด์
         t.setColumnWidth(8, 60)    # คะแนน
-        t.setColumnWidth(9, 130)   # สถานะ
+        t.setColumnWidth(9, 200)   # สถานะ (กว้างไว้โชว์คำเตือนยอดตรง)
         t.setColumnWidth(10, 130)  # ดูใน FlowAccount
         t.setColumnWidth(11, 80)   # รูป
+        t.setColumnWidth(12, 130)  # เลือกใบเอง
         t.verticalHeader().setVisible(False)
         t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         t.setStyleSheet("QTableWidget{border:1px solid #e2e8f0;font-size:12px;}")
@@ -7323,6 +7379,10 @@ class SlipMatchTab(QWidget):
             else:
                 bg = C_OVERDUE
                 st_txt = "🔴 ไม่เจอคู่"
+            n_amt = res.get("amount_match_n") or 0
+            if n_amt:     # ยอดตรงแต่ชื่อไม่ตรง/เท่ากันหลายใบ → เตือนให้กดเลือกใบเอง
+                st_txt = f"⚠️ ยอดตรง {n_amt} ใบ — กดเลือกใบเอง"
+                bg = QColor("#fed7aa")
             # col 0: checkbox เลือก (สำหรับ "นำกลับ" เข้าหน้าเตรียมดำเนินการ)
             chk = QCheckBox()
             chk.setChecked(id(res) in self._checked_un)
@@ -7351,6 +7411,10 @@ class SlipMatchTab(QWidget):
                 if col == 4:   # ยอด ชิดขวา
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 item.setBackground(QBrush(bg))
+                if col == 8 and res.get("match_note"):
+                    item.setToolTip(res["match_note"])
+                if col == 3 and s.get("_name_unsure"):
+                    item.setToolTip("OCR อ่านชื่อจากรูปได้ไม่ชัด — ตรวจชื่อกับรูปสลิปอีกครั้ง")
                 self.table_un.setItem(row, col, item)
             if _is_sens_un:
                 is_rev_un = id(res) in self._revealed_slip_ids
@@ -7378,6 +7442,8 @@ class SlipMatchTab(QWidget):
                 self.table_un.setCellWidget(row, 9, bw)
             # col 10: รูปสลิป
             self._add_image_cell(self.table_un, row, 10, s)
+            # col 11: ปุ่มเลือกใบเอง
+            self._add_pick_button(self.table_un, row, 11, res)
         # อัปเดตชื่อแท็บ (แท็บไม่เจอคู่ = index 2)
         if hasattr(self, "subtabs"):
             self.subtabs.setTabText(2, f"🔴 ไม่เจอคู่ ({n_un})")
@@ -7444,9 +7510,14 @@ class SlipMatchTab(QWidget):
                      if abs(_amount(e) - amt) <= 0.01 and _exp_id(e) not in used]
             if not cands:
                 continue
+            cands.sort(key=lambda c: _slip_date_dist(s, c))     # วันที่ใกล้วันโอนที่สุดก่อน
             e = cands[0]
+
+            def _gap(c):
+                d = _slip_date_dist(s, c)
+                return f" (ห่าง {d} วัน)" if d < 9999 else ""
             lines = "\n".join(
-                f"   • {_slip_exp_serial(c)} | {_vendor(c)} | {fmt_amount(_amount(c))}"
+                f"   • {_slip_exp_serial(c)} | {_vendor(c)} | {fmt_amount(_amount(c))}{_gap(c)}"
                 for c in cands[:5])
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Question)
@@ -7544,6 +7615,13 @@ class SlipMatchTab(QWidget):
             status_txt = "✅ เจอคู่ (รายละเอียด)"
         elif res.get("via") == "amount_detail":
             status_txt = "✅ เจอคู่ (ยอดย่อย/หัก)"
+        elif res.get("via") == "date":
+            status_txt = "✅ เจอคู่ (วันที่ใกล้สุด)"
+        # ยอดตรงกับเอกสารแต่ยังยืนยันไม่ได้ (ชื่อไม่ตรง/ยอดเท่ากันหลายใบ) → เตือน + ให้กดเลือกใบเอง
+        n_amt = res.get("amount_match_n") or 0
+        if status in ("amount_only", "unmatched") and n_amt:
+            status_txt = f"⚠️ ยอดตรง {n_amt} ใบ — กดเลือกใบเอง"
+            bg = QColor("#fed7aa")
         # รายการที่ผู้ใช้ 'นำกลับ' จากหน้าไม่เจอคู่ → ทำเป็นสีแดง + ป้ายเตือนให้ตรวจ
         if res.get("promoted"):
             bg = C_OVERDUE
@@ -7588,6 +7666,8 @@ class SlipMatchTab(QWidget):
             # บอกเหตุผลการจับ (หัก ณ ที่จ่าย/ยอดย่อย) เมื่อชี้ที่ช่องสถานะ (col 9)
             if col == 9 and res.get("match_note"):
                 item.setToolTip(res["match_note"])
+            if col == 3 and slip.get("_name_unsure"):
+                item.setToolTip("OCR อ่านชื่อจากรูปได้ไม่ชัด — ตรวจชื่อกับรูปสลิปอีกครั้ง")
             table.setItem(row, col, item)
         if _is_sensitive:
             is_rev = id(res) in self._revealed_slip_ids
@@ -7618,6 +7698,27 @@ class SlipMatchTab(QWidget):
 
         # col 11: รูปสลิปที่ตัดแล้ว (เก็บใน RAM) — กดดูในโปรแกรม
         self._add_image_cell(table, row, 11, slip)
+
+        # col 12: ปุ่ม "เลือกใบเอง" — เฉพาะแถวที่ยังไม่เจอคู่/ยังไม่ชัวร์
+        if status in ("amount_only", "unmatched"):
+            self._add_pick_button(table, row, 12, res)
+
+    def _add_pick_button(self, table, row, col, res):
+        """ปุ่ม 'เลือกใบเอง' — เปิดหน้าต่างเลือกเอกสาร (ยอดตรงขึ้นก่อน เรียงตามวันที่ใกล้สุด)"""
+        n = res.get("amount_match_n") or 0
+        btn = QPushButton(f"🎯 เลือกใบ ({n})" if n else "🎯 เลือกใบ")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        color = "#ea580c" if n else "#2563eb"
+        btn.setStyleSheet(
+            f"QPushButton{{padding:2px 8px;border:1px solid {color};border-radius:4px;"
+            f"background:white;color:{color};font-size:11px;font-weight:600;}}"
+            "QPushButton:hover{background:#fff7ed;}")
+        btn.setToolTip(res.get("match_note") or "เลือกเอกสารที่จะจับคู่กับสลิปนี้")
+        btn.clicked.connect(lambda _=False, r=res: self._do_manual_match(r))
+        w = QWidget(); l = QHBoxLayout(w)
+        l.addWidget(btn); l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        l.setContentsMargins(0, 0, 0, 0)
+        table.setCellWidget(row, col, w)
 
     def _add_image_cell(self, table, row, col, slip):
         """ใส่ปุ่มดูรูปสลิป (ถ้ามีรูปที่ตัดไว้ใน RAM)"""
@@ -9499,7 +9600,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.5.2"
+APP_VERSION = "4.6"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -9631,6 +9732,19 @@ QToolTip { background-color: #2a2b2e; color: #e8eaed; border: 1px solid #5f6368;
 """
 
 CHANGELOG = [
+    {
+        "version": "4.6",
+        "date": "12/11/2569",
+        "title": "ตัดบิล: อ่านสลิปไทย (KBIZ) + จับคู่ด้วยวันที่ + เตือนยอดตรงชื่อไม่ตรง",
+        "items": [
+            "อ่านสลิปรูปภาพ 'โอนเงินสำเร็จ' ภาษาไทยได้แล้ว — ชื่อผู้รับ ยอด วันที่ เวลา ธนาคาร (OCR ไทยในตัว ทำงานออฟไลน์)",
+            "ยอดเท่ากันหลายใบ + ชื่อผู้ขายเดียวกัน → ให้ 'วันที่' ใกล้วันโอนที่สุดเป็นตัวตัดสินหลัก",
+            "ชื่อไม่ตรงแต่ยอดตรง → ขึ้นเตือน ⚠️ ที่แถวนั้น พร้อมปุ่ม 🎯 เลือกใบเอง",
+            "หน้าต่างเลือกใบ: แสดงใบยอดตรงก่อน เรียงตามวันที่ใกล้สุด โชว์วันที่เอกสาร/ครบกำหนด/ห่างกี่วัน",
+            "จับคู่รอบ 2 (ตามยอดเงิน) เรียงตามวันที่ใกล้สุด",
+            "ขนาดโปรแกรมใหญ่ขึ้นเพราะแนบ OCR ไทย",
+        ],
+    },
     {
         "version": "4.5.2",
         "date": "02/10/2569",
