@@ -200,8 +200,41 @@ def authenticate(username: str, password: str):
     return None
 
 
+def pull_from_cloud() -> bool:
+    """ดึงผู้ใช้ทั้งหมดจาก cloud มารวมกับไฟล์ในเครื่อง (cloud ชนะ) — ให้เห็นผู้ใช้ที่สร้างจากเครื่องอื่นด้วย
+    คืน True ถ้าติดต่อ cloud ได้"""
+    try:
+        import cloud_log
+        cfg = _cloud_cfg()
+        if not cloud_log.is_configured(cfg):
+            return False
+        cloud = cloud_log.fetch_cloud_users(cfg)
+        if not cloud:
+            return False
+        users = ensure_seed()
+        changed = False
+        for cu in cloud:
+            name = cu.get("username", "")
+            if not name:
+                continue
+            new = {"username": name, "salt": cu.get("salt", ""), "pwhash": cu.get("pwhash", ""),
+                   "fullname": cu.get("fullname", ""), "nickname": cu.get("nickname", ""),
+                   "role": cu.get("role", "user")}
+            cur = _find(users, name)
+            if cur is None:
+                users.append(new); changed = True
+            elif any(cur.get(k) != new[k] for k in new):
+                cur.update(new); changed = True
+        if changed:
+            _save(users)
+        return True
+    except Exception:
+        return False
+
+
 def list_users(viewer_role: str) -> list:
     """รายชื่อผู้ใช้ — admin จะไม่เห็น dev"""
+    pull_from_cloud()
     out = []
     for u in ensure_seed():
         if viewer_role != "dev" and u["role"] == "dev":
@@ -224,6 +257,7 @@ def add_user(viewer_role, username, password, fullname, nickname, role="user"):
         raise ValueError("ต้องมี username และ password")
     if viewer_role != "dev" and role != "user":
         raise PermissionError("admin สร้างได้เฉพาะผู้ใช้ทั่วไป (user) เท่านั้น")
+    pull_from_cloud()
     users = ensure_seed()
     if _find(users, username):
         raise ValueError(f"มี username '{username}' อยู่แล้ว")
@@ -233,7 +267,7 @@ def add_user(viewer_role, username, password, fullname, nickname, role="user"):
     try:
         import cloud_log
         cfg = _cloud_cfg()
-        cloud_log.upsert_user_async(cfg, {
+        cloud_log.upsert_user(cfg, {
             "username": new_user["username"], "salt": new_user["salt"],
             "pwhash": new_user["pwhash"], "fullname": new_user["fullname"],
             "nickname": new_user["nickname"], "role": new_user["role"],
@@ -243,6 +277,7 @@ def add_user(viewer_role, username, password, fullname, nickname, role="user"):
 
 
 def delete_user(viewer_role, username):
+    pull_from_cloud()
     users = ensure_seed()
     u = _find(users, username)
     if not u:
@@ -260,6 +295,7 @@ def delete_user(viewer_role, username):
 
 def update_user(viewer_role, username, *, password=None, fullname=None,
                 nickname=None, role=None):
+    pull_from_cloud()
     users = ensure_seed()
     u = _find(users, username)
     if not u:
@@ -280,7 +316,7 @@ def update_user(viewer_role, username, *, password=None, fullname=None,
     _save(users)
     try:
         import cloud_log
-        cloud_log.upsert_user_async(_cloud_cfg(), {
+        cloud_log.upsert_user(_cloud_cfg(), {
             "username": u["username"], "salt": u["salt"],
             "pwhash": u["pwhash"], "fullname": u["fullname"],
             "nickname": u["nickname"], "role": u["role"],

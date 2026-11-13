@@ -331,6 +331,18 @@ class DocHistoryIndexWorker(QThread):
         self.done.emit(idx)
 
 
+class CloudSyncWorker(QThread):
+    """ซิงก์ แผนจัดคิว/หมายเหตุ/ไม่อนุมัติ/รออัพเดต กับ cloud เบื้องหลัง — done(True) = ข้อมูลในเครื่องเปลี่ยน"""
+    done = pyqtSignal(bool)
+
+    def run(self):
+        try:
+            import cloud_sync
+            self.done.emit(bool(cloud_sync.sync_all()))
+        except Exception:
+            self.done.emit(False)
+
+
 class FetchWorker(QThread):
     done    = pyqtSignal(list)
     error   = pyqtSignal(str)
@@ -519,7 +531,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.restricted = restricted   # True = แก้ได้เฉพาะ 'จำนวนรายการที่ดึง' (ผู้ใช้ที่ไม่ใช่ dev)
         self.setWindowTitle("⚙️ ตั้งค่า" + (" (แก้ไขได้เฉพาะจำนวนรายการที่ดึง)" if restricted else ""))
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(600)
         self.cfg = load_config()
         self._build_ui()
         if restricted:
@@ -533,9 +545,41 @@ class SettingsDialog(QDialog):
             if isinstance(w, (QLineEdit, QTextEdit, QCheckBox, QComboBox)) and w is not keep:
                 w.setEnabled(False)
 
+    def _copy_row(self, edit):
+        """ช่องกรอก + ปุ่ม 📋 คัดลอกค่า (เฉพาะ Dev — ผู้ใช้ทั่วไปไม่มีปุ่ม)"""
+        if self.restricted:
+            return edit
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(edit, 1)
+        btn = QPushButton("📋")
+        btn.setToolTip("คัดลอกค่านี้")
+        btn.setFixedWidth(34)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        def _do(_=False, e=edit, b=btn):
+            QApplication.clipboard().setText(e.text())
+            b.setText("✅")
+            QTimer.singleShot(1200, lambda: b.setText("📋"))
+        btn.clicked.connect(_do)
+        h.addWidget(btn)
+        return w
+
+    def _page(self, tabs, title, *boxes):
+        pg = QWidget()
+        lay = QVBoxLayout(pg)
+        lay.setSpacing(10)
+        for b in boxes:
+            lay.addWidget(b)
+        lay.addStretch(1)
+        tabs.addTab(pg, title)
+
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
+        tabs = QTabWidget()
+        layout.addWidget(tabs, 1)
 
         # FlowAccount section
         fa_box = QGroupBox("🔑 FlowAccount API")
@@ -545,14 +589,13 @@ class SettingsDialog(QDialog):
         self.secret_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.ed_fetch_limit = QLineEdit(str(self.cfg.get("fetch_limit", 1000)))
         self.ed_fetch_limit.setFixedWidth(100)
-        fa_form.addRow("Client ID (API Key):", self.api_key)
-        fa_form.addRow("Client Secret:", self.secret_key)
+        fa_form.addRow("Client ID (API Key):", self._copy_row(self.api_key))
+        fa_form.addRow("Client Secret:", self._copy_row(self.secret_key))
         fa_form.addRow("จำนวนรายการที่ดึง (ล่าสุด):", self.ed_fetch_limit)
         fl_hint = QLabel("ดึงรายการใหม่สุดตามจำนวนนี้ (ดึงพร้อมกันหลายหน้า เร็วขึ้น) — มากไป=ช้าลง แนะนำ 1000")
         fl_hint.setStyleSheet(f"color:{C_MUTED};font-size:11px;")
         fl_hint.setWordWrap(True)
         fa_form.addRow("", fl_hint)
-        layout.addWidget(fa_box)
 
         # Company section
         co_box = QGroupBox("🏢 ข้อมูลบริษัท")
@@ -561,7 +604,7 @@ class SettingsDialog(QDialog):
         self.bank_acct  = QLineEdit(self.cfg.get("bank_account", ""))
         co_form.addRow("ชื่อบริษัท:", self.company)
         co_form.addRow("เลขบัญชีธนาคาร:", self.bank_acct)
-        layout.addWidget(co_box)
+        self._page(tabs, "🔑 FlowAccount", fa_box, co_box)
 
         # monday.com section
         mn_box = QGroupBox("📋 monday.com Integration")
@@ -584,10 +627,10 @@ class SettingsDialog(QDialog):
         sync_row.addWidget(self.monday_m)
         sync_row.addWidget(QLabel("น."))
         sync_row.addStretch()
-        mn_form.addRow("API Token:", self.monday_token)
-        mn_form.addRow("Board ID:", self.monday_board)
+        mn_form.addRow("API Token:", self._copy_row(self.monday_token))
+        mn_form.addRow("Board ID:", self._copy_row(self.monday_board))
         mn_form.addRow("", sync_row)
-        layout.addWidget(mn_box)
+        self._page(tabs, "📋 monday", mn_box)
 
         # Daily payment limit
         dl_box  = QGroupBox("💰 วงเงินจ่ายต่อวัน (default)")
@@ -601,7 +644,6 @@ class SettingsDialog(QDialog):
         dl_hint = QLabel("ใส่ 0 หรือ 'ไม่จำกัด' = ไม่จำกัดวงเงิน")
         dl_hint.setStyleSheet(f"color:{C_MUTED};font-size:11px;")
         dl_form.addRow("", dl_hint)
-        layout.addWidget(dl_box)
 
         # วันหยุด (สำหรับคำนวณวันจ่าย)
         hd_box  = QGroupBox("📅 วันหยุด (ใช้คำนวณวันจ่าย)")
@@ -629,7 +671,7 @@ class SettingsDialog(QDialog):
         hd_hint.setStyleSheet(f"color:{C_MUTED};font-size:11px;")
         hd_hint.setWordWrap(True)
         hd_form.addRow("", hd_hint)
-        layout.addWidget(hd_box)
+        self._page(tabs, "💰 วงเงิน/วันหยุด", dl_box, hd_box)
 
         # Brand list section
         br_box  = QGroupBox("🏷️ รายชื่อแบรนด์ (ตัวเลือกใน dropdown)")
@@ -648,15 +690,14 @@ class SettingsDialog(QDialog):
         blist = self.cfg.get("brand_list") or []
         self.brand_text.setPlainText("\n".join(blist))
         br_form.addWidget(self.brand_text)
-        layout.addWidget(br_box)
+        self._page(tabs, "🏷️ แบรนด์", br_box)
 
         # Line section
         ln_box = QGroupBox("📱 Line Notify (ไม่บังคับ)")
         ln_form = QFormLayout(ln_box)
         self.line_token = QLineEdit(self.cfg.get("line_token", ""))
         self.line_token.setEchoMode(QLineEdit.EchoMode.Password)
-        ln_form.addRow("Line Notify Token:", self.line_token)
-        layout.addWidget(ln_box)
+        ln_form.addRow("Line Notify Token:", self._copy_row(self.line_token))
 
         # GitHub token — สำหรับ Export Link แบบลิงก์ถาวร (ไม่หมดอายุ)
         gh_box = QGroupBox("🔗 Export Link ถาวร (GitHub – ไม่บังคับ)")
@@ -664,14 +705,14 @@ class SettingsDialog(QDialog):
         self.github_token = QLineEdit(self.cfg.get("github_token", ""))
         self.github_token.setEchoMode(QLineEdit.EchoMode.Password)
         self.github_token.setPlaceholderText("ghp_... (สิทธิ์ gist)")
-        gh_form.addRow("GitHub Token:", self.github_token)
+        gh_form.addRow("GitHub Token:", self._copy_row(self.github_token))
         gh_hint = QLabel(
             "ใส่ token แล้ว ปุ่ม 'Export Link' จะได้ลิงก์ <b>ถาวร ไม่หมดอายุ</b> "
             "(เปิดบนมือถือได้)<br>ถ้าเว้นว่าง = ใช้ลิงก์ชั่วคราว 72 ชม. แทน")
         gh_hint.setStyleSheet(f"color:{C_MUTED};font-size:11px;")
         gh_hint.setWordWrap(True)
         gh_form.addRow("", gh_hint)
-        layout.addWidget(gh_box)
+        self._page(tabs, "🔗 Line/GitHub", ln_box, gh_box)
 
         # Buttons
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -1091,7 +1132,7 @@ class QueuePlanDialog(QDialog):
                 age = (datetime.now()
                        - datetime.fromisoformat(saved["saved_at"][:19])).days
                 if age >= 3:
-                    queue_plan.clear_plan()
+                    queue_plan.clear_plan(push=False)   # หมดอายุ = ล้างเฉพาะในเครื่อง ไม่ประกาศลบบน cloud
                     saved = {}
             except Exception:
                 pass
@@ -4208,6 +4249,25 @@ class QueueTab(QWidget):
         activity_log.log("ดึงข้อมูล", f"ดึงค่าใช้จ่าย {len(expenses)} รายการ",
                          "ทุกบริษัท" if self._combined else "")
         self._start_doc_history_fetch()
+        self._start_cloud_sync()
+
+    def _start_cloud_sync(self):
+        """ซิงก์ข้อมูลที่ใช้ร่วมกันกับ cloud เบื้องหลัง (ทุกครั้งที่รีเฟรช)"""
+        w = getattr(self, "_cloud_sync_worker", None)
+        if w is not None and w.isRunning():
+            return
+        self._cloud_sync_worker = CloudSyncWorker(self)
+        self._cloud_sync_worker.done.connect(
+            lambda changed: self._render_page() if changed else None)
+        self._cloud_sync_worker.start()
+
+    def _sync_now(self):
+        """ซิงก์ก่อนเปิดหน้าจัดคิว (ข้ามถ้าเพิ่งซิงก์ไม่เกิน 20 วินาที)"""
+        try:
+            import cloud_sync
+            cloud_sync.sync_if_stale(20)
+        except Exception:
+            pass
 
     def _start_doc_history_fetch(self):
         """โหลด/รีเฟรชดัชนี 'เคยจัดคิวกี่ครั้ง' เบื้องหลัง — ไม่บล็อก UI"""
@@ -4841,6 +4901,7 @@ class QueueTab(QWidget):
     def _auto_queue(self):
         """จัดคิวอัตโนมัติ — กระจายเป็นหลายวัน (ค่าเริ่มต้น 3 วัน) แล้วเลือกทั้งหมด
         เพิ่ม: เลือกเดือนจากปฏิทินได้ → จัดเฉพาะบิลของเดือนนั้น (ไม่เลือก = จัดทั้งหมดแบบเดิม)"""
+        self._sync_now()
         from PyQt6.QtWidgets import (QInputDialog, QDialog, QVBoxLayout,
                                      QHBoxLayout, QDateEdit)
         if not self._expenses:
@@ -5003,6 +5064,7 @@ class QueueTab(QWidget):
 
     def _open_queue_plan(self):
         """เปิดหน้าตารางคิวจ่ายหลายวัน — ดู/โยกรายการสลับวันได้"""
+        self._sync_now()
         if not self._expenses:
             QMessageBox.information(self, "ยังไม่มีข้อมูล",
                 "กรุณากด 🔄 รีเฟรช เพื่อดึงข้อมูลก่อนครับ")
@@ -9600,7 +9662,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.6"
+APP_VERSION = "4.6.1"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -9732,6 +9794,17 @@ QToolTip { background-color: #2a2b2e; color: #e8eaed; border: 1px solid #5f6368;
 """
 
 CHANGELOG = [
+    {
+        "version": "4.6.1",
+        "date": "13/11/2569",
+        "title": "ซิงก์ข้อมูลร่วมกันทุกเครื่อง + แก้จัดการผู้ใช้ + ปรับหน้าตั้งค่า",
+        "items": [
+            "ซิงก์ผ่าน cloud: แผนจัดคิว, หมายเหตุ, รายการไม่อนุมัติ, จ่ายแล้วรออัพเดต — ทุกเครื่องเห็นตรงกัน (ซิงก์ทุกครั้งที่กดรีเฟรช/เปิดหน้าจัดคิว; ออฟไลน์ใช้ในเครื่องแล้วส่งขึ้นทีหลัง)",
+            "แก้: เปลี่ยนสิทธิ์/แก้ข้อมูลผู้ใช้ไม่ถึง cloud ทำให้ล็อกอินแล้วสิทธิ์ยังเป็นของเก่า",
+            "แก้: หน้าจัดการผู้ใช้แสดงไม่ครบ — ตอนนี้ดึงผู้ใช้จาก cloud ครบทุกคน",
+            "หน้าตั้งค่า: แบ่งเป็นแท็บ (ไม่ยาวเกินจอ) + ปุ่มคัดลอก Client ID/Secret/Token/Board ID (เฉพาะ Dev)",
+        ],
+    },
     {
         "version": "4.6",
         "date": "12/11/2569",

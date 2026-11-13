@@ -29,7 +29,7 @@ def load_plan() -> dict:
         return {}
 
 
-def save_plan(days_of_ids: list, saved_at: str, dates: list = None) -> None:
+def save_plan(days_of_ids: list, saved_at: str, dates: list = None, push: bool = True) -> None:
     """dates: list วันที่ (iso yyyy-mm-dd) ต่อวัน — วันที่ผู้ใช้กำหนดเอง (ถ้ามี)"""
     p = _path()
     try:
@@ -39,14 +39,28 @@ def save_plan(days_of_ids: list, saved_at: str, dates: list = None) -> None:
             data["dates"] = dates
         with open(p, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        if push:
+            _push("plan", data)
     except Exception:
         pass
 
 
-def clear_plan() -> None:
+def clear_plan(push: bool = True) -> None:
+    """push=False: ล้างเฉพาะในเครื่อง (เช่นแผนหมดอายุ 3 วัน / ล้างตามเครื่องอื่น) ไม่ประกาศลบบน cloud"""
     p = _path()
     if os.path.exists(p):
         try:
             os.remove(p)
         except Exception:
             pass
+    if push:
+        _push("plan", deleted=True)
+
+
+def _push(key, value=None, deleted=False):
+    """ส่งขึ้น cloud เบื้องหลัง (ซิงก์ทุกเครื่อง) — ไม่มี cloud/ผิดพลาด = ข้ามเงียบ"""
+    try:
+        import cloud_sync
+        cloud_sync.push_async("queue_plan", key, value, deleted)
+    except Exception:
+        pass

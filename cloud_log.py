@@ -292,20 +292,29 @@ def migrate_local_logs(cfg: dict, activity_rows: list,
 # ── Cloud Users (sync user accounts) ────────────────────────────
 
 def upsert_user(cfg: dict, user_data: dict) -> bool:
+    """บันทึกผู้ใช้ขึ้น cloud — แก้แถวเดิม (PATCH ตาม username) ถ้าไม่มีค่อยเพิ่มใหม่ (POST)
+    (เดิมใช้ POST merge-duplicates อย่างเดียว ซึ่งไม่ได้อัปเดตแถวที่ username ซ้ำ → role/ชื่อที่แก้ไม่ถึง cloud)"""
     url = cfg.get("supabase_url", "").rstrip("/")
     key = cfg.get("supabase_key", "")
-    if not url or not key:
+    uname = user_data.get("username", "")
+    if not url or not key or not uname:
         return False
     try:
-        headers = _headers(key)
-        headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
-        r = requests.post(
-            f"{url}/rest/v1/users",
-            headers=headers,
-            json=user_data,
-            timeout=10,
-        )
-        return r.status_code in (200, 201)
+        h = _headers(key)
+        h["Prefer"] = "return=representation"
+        body = {k: v for k, v in user_data.items() if k != "username"}
+        r = requests.patch(f"{url}/rest/v1/users", headers=h,
+                           params={"username": f"eq.{uname}"}, json=body, timeout=10)
+        if r.status_code in (200, 204):
+            try:
+                if r.status_code == 204 or r.json():
+                    return True
+            except Exception:
+                return True
+        h2 = _headers(key)
+        h2["Prefer"] = "return=minimal"
+        r2 = requests.post(f"{url}/rest/v1/users", headers=h2, json=user_data, timeout=10)
+        return r2.status_code in (200, 201)
     except Exception:
         return False
 

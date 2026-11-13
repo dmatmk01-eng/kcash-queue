@@ -14,7 +14,7 @@ a = Analysis(
     pathex=[],
     binaries=_ro_bins,
     datas=[('icon', 'icon'), ('ocr_models', 'ocr_models')] + _ro_datas,
-    hiddenimports=['cloud_log', 'expense_tiers', 'slip_ocr', 'onnxruntime', 'cv2',
+    hiddenimports=['cloud_log', 'cloud_sync', 'expense_tiers', 'slip_ocr', 'onnxruntime', 'cv2',
                    'shapely', 'pyclipper', 'omegaconf', 'colorlog', 'yaml'] + _ro_hidden,
     hookspath=[],
     hooksconfig={},
