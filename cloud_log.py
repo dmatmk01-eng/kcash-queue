@@ -291,6 +291,21 @@ def migrate_local_logs(cfg: dict, activity_rows: list,
 
 # ── Cloud Users (sync user accounts) ────────────────────────────
 
+def create_user_if_missing(cfg: dict, user_data: dict) -> bool:
+    """เพิ่มผู้ใช้ขึ้น cloud เฉพาะที่ยังไม่มี — ห้ามทับแถวเดิม (กัน role/ข้อมูลที่แก้บน cloud ถูกเครื่องที่มีไฟล์เก่าเขียนทับ)"""
+    url = cfg.get("supabase_url", "").rstrip("/")
+    key = cfg.get("supabase_key", "")
+    if not url or not key or not user_data.get("username"):
+        return False
+    try:
+        h = _headers(key)
+        h["Prefer"] = "return=minimal"
+        r = requests.post(f"{url}/rest/v1/users", headers=h, json=user_data, timeout=10)
+        return r.status_code in (200, 201)      # 409 = มีอยู่แล้ว → ไม่แตะ
+    except Exception:
+        return False
+
+
 def upsert_user(cfg: dict, user_data: dict) -> bool:
     """บันทึกผู้ใช้ขึ้น cloud — แก้แถวเดิม (PATCH ตาม username) ถ้าไม่มีค่อยเพิ่มใหม่ (POST)
     (เดิมใช้ POST merge-duplicates อย่างเดียว ซึ่งไม่ได้อัปเดตแถวที่ username ซ้ำ → role/ชื่อที่แก้ไม่ถึง cloud)"""
@@ -375,7 +390,7 @@ def migrate_users(cfg: dict, local_users: list) -> dict:
             "nickname": u.get("nickname", ""),
             "role": u.get("role", "user"),
         }
-        if upsert_user(cfg, data):
+        if create_user_if_missing(cfg, data):
             count += 1
     return {"ok": True, "count": count}
 

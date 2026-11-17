@@ -188,11 +188,12 @@ def authenticate(username: str, password: str):
                 _sync_local_to_cloud()
                 try:
                     import cloud_log
-                    cloud_log.upsert_user_async(_cloud_cfg(), {
+                    import threading
+                    threading.Thread(target=cloud_log.create_user_if_missing, args=(_cloud_cfg(), {
                         "username": u["username"], "salt": u["salt"],
                         "pwhash": u["pwhash"], "fullname": u["fullname"],
                         "nickname": u["nickname"], "role": u["role"],
-                    })
+                    }), daemon=True).start()
                 except Exception:
                     pass
                 return {k: v for k, v in u.items() if k not in ("salt", "pwhash")}

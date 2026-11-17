@@ -9662,7 +9662,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.6.1"
+APP_VERSION = "4.6.2"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -9794,6 +9794,15 @@ QToolTip { background-color: #2a2b2e; color: #e8eaed; border: 1px solid #5f6368;
 """
 
 CHANGELOG = [
+    {
+        "version": "4.6.2",
+        "date": "17/11/2569",
+        "title": "แก้สิทธิ์ผู้ใช้ถูกเขียนทับกลับเป็นค่าเก่า",
+        "items": [
+            "แก้: ตอนล็อกอิน/เปิดโปรแกรม ไฟล์ผู้ใช้เก่าในเครื่องส่งไปทับสิทธิ์/ข้อมูลผู้ใช้บน cloud — ตอนนี้เพิ่มเฉพาะผู้ใช้ที่ยังไม่มี ไม่ทับของเดิม",
+            "เปลี่ยนสิทธิ์/แก้ผู้ใช้ทำได้จากหน้า 'จัดการผู้ใช้' เท่านั้น",
+        ],
+    },
     {
         "version": "4.6.1",
         "date": "13/11/2569",
