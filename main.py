@@ -6657,6 +6657,10 @@ class SlipImageWorker(QThread):
             self.error.emit(str(exc))
 
 
+class _AlreadyPaid(Exception):
+    """เอกสารจ่ายแล้วใน FlowAccount — ข้ามขั้นบันทึกจ่าย"""
+
+
 class SlipAttachWorker(QThread):
     """ตัดบิลเป็นรูป + แนบเข้า FlowAccount + เปลี่ยนสถานะเป็นจ่ายแล้ว (background) — Phase 2"""
     progress = pyqtSignal(int, int)
@@ -6691,9 +6695,11 @@ class SlipAttachWorker(QThread):
             eid = e.get("recordId") or e.get("documentId")
             attach_err = status_err = ""
 
-            # 1) แนบสลิป — ชื่อไฟล์ = เลขเอกสาร_ชื่อคน
+            # 1) แนบสลิป — ชื่อไฟล์ = เลขเอกสาร_ชื่อคน (เคยแนบในรอบนี้แล้ว = ข้าม กันไฟล์ซ้ำ)
             try:
-                if not png:
+                if res.get("_attached"):
+                    pass
+                elif not png:
                     raise RuntimeError("ตัดรูปไม่ได้")
                 import re as _re
                 nm = _re.sub(r"[\\/:*?\"<>|]", "", (s.get("recv_name") or "")).strip()[:30]
@@ -6705,13 +6711,18 @@ class SlipAttachWorker(QThread):
                             _f.write(png)
                     except Exception:
                         pass
-                upload_expense_attachment(cid, csec, eid, png, fn)
+                if not res.get("_attached"):
+                    upload_expense_attachment(cid, csec, eid, png, fn)
+                    res["_attached"] = True
             except Exception as ex:
                 attach_err = str(ex)[:120]
 
             # 2) เปลี่ยนสถานะเป็นจ่ายแล้วใน FlowAccount
+            #    เอกสารที่ 'จ่ายแล้ว' อยู่แล้ว → ข้าม (FlowAccount ไม่ให้บันทึกจ่ายซ้ำ: "paid with multiple payment channels")
             pay_date = s.get("pay_date") or today_str()
             try:
+                if _is_paid(e):
+                    raise _AlreadyPaid()
                 mark_expense_paid(cid, csec, eid, {
                     "paymentDate": pay_date,
                     "amount": _amount(e) or s.get("amount") or 0,
@@ -6721,6 +6732,8 @@ class SlipAttachWorker(QThread):
                 # อัปเดตสถานะในโปรแกรม (รายการเดียวกัน ref ร่วมกับหน้าคิว)
                 e["statusString"] = "paid"
                 e["payments"] = [{"paymentDate": pay_date}]
+            except _AlreadyPaid:
+                pass        # จ่ายแล้วใน FlowAccount อยู่แล้ว — แนบสลิปอย่างเดียว ไม่ถือเป็นข้อผิดพลาด
             except Exception as ex:
                 status_err = str(ex)[:120]
 
@@ -7304,6 +7317,12 @@ class SlipMatchTab(QWidget):
             f"บันทึกรูปสลิป {saved} รูปแล้ว\n{folder}")
         QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
+    def _paid_note(self, matched):
+        """ข้อความเตือนในหน้าต่างยืนยัน: กี่รายการที่จ่ายแล้วใน FlowAccount (จะแนบสลิปอย่างเดียว)"""
+        n = sum(1 for r in matched if r.get("expense") and _is_paid(r["expense"]))
+        return (f"\nℹ️ {n} รายการ 'จ่ายแล้ว' ใน FlowAccount อยู่แล้ว — จะแนบสลิปอย่างเดียว ไม่บันทึกจ่ายซ้ำ\n"
+                if n else "")
+
     def _cut_and_attach(self):
         """ตัดบิล + แนบเข้า FlowAccount (รายการที่มีคู่ค่าใช้จ่าย และที่ติ๊กเลือก)"""
         sel = self._selected_results()
@@ -7325,7 +7344,7 @@ class SlipMatchTab(QWidget):
                 "(เลือก 'ทั้งหมด' เพื่อรวมที่ระบบเดา หรือจับคู่เองก่อน)")
             return
         if QMessageBox.warning(self, "⚠️ ยืนยันแนบสลิป + เปลี่ยนสถานะจ่ายแล้ว",
-                f"จะดำเนินการกับรายการที่จับคู่ได้ {len(matched)} รายการ:\n\n"
+                f"จะดำเนินการกับรายการที่จับคู่ได้ {len(matched)} รายการ:{self._paid_note(matched)}\n\n"
                 "1) ตัดสลิปแนบเข้ารายการจริงใน FlowAccount\n"
                 "2) เปลี่ยนสถานะเป็น 'จ่ายแล้ว' ทั้งในโปรแกรมและ FlowAccount\n\n"
                 "⚠️ เปลี่ยนข้อมูลใน FlowAccount จริง — ยืนยันดำเนินการ?",
@@ -9662,7 +9681,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.6.2"
+APP_VERSION = "4.6.3"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -9794,6 +9813,16 @@ QToolTip { background-color: #2a2b2e; color: #e8eaed; border: 1px solid #5f6368;
 """
 
 CHANGELOG = [
+    {
+        "version": "4.6.3",
+        "date": "17/11/2569",
+        "title": "ตัดบิล+แนบ: ใบที่จ่ายแล้วไม่ขึ้นเฟลอีก",
+        "items": [
+            "แก้: สลิปที่จับคู่กับใบที่ 'จ่ายแล้ว' อยู่แล้วใน FlowAccount ขึ้นเฟล (This document was paid with multiple payment channels) — ตอนนี้แนบสลิปอย่างเดียว ข้ามขั้นบันทึกจ่าย",
+            "กันแนบสลิปซ้ำ: รายการที่แนบสำเร็จแล้วในรอบการใช้งานจะไม่แนบซ้ำ",
+            "หน้าต่างยืนยันแจ้งจำนวนรายการที่จ่ายแล้วอยู่แล้ว",
+        ],
+    },
     {
         "version": "4.6.2",
         "date": "17/11/2569",
