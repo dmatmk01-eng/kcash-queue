@@ -834,6 +834,8 @@ class QueuePlanDialog(QDialog):
         self._day_dates_override = {}   # {index วัน: 'yyyy-mm-dd'} วันจ่ายที่ผู้ใช้กำหนดเอง
         self._small_items = []     # ย่อย ≤10k (แยกอัตโนมัติ)
         self._urgent_items = []    # ด่วน ≤20k (เลือกมือ)
+        self._fresh_plan = False   # True = ยังไม่มีคิวที่บันทึกไว้ (เพิ่งกระจายใหม่)
+        self._baseline = None      # สภาพคิวตอนเปิด/บันทึกล่าสุด — ใช้เช็คว่ามีการแก้ไหม
 
         if preset_days is not None:
             # โหมดแก้ไขจากประวัติ — ใช้การจัดเรียง/วันที่ตามที่ส่งมา (ไม่โหลดแผนปัจจุบัน)
@@ -842,6 +844,10 @@ class QueuePlanDialog(QDialog):
                 self._day_dates_override = {
                     i: str(iso)[:10] for i, iso in enumerate(preset_dates) if iso}
             self._saved_at = ""
+            for grp in self._days:
+                for e in grp:
+                    e.pop("_tier_tag", None)
+                    self._tag_tier(e)
         else:
             # sync tier + credit vendors จาก cloud ก่อนจัดคิว
             try:
@@ -853,6 +859,26 @@ class QueuePlanDialog(QDialog):
             self._days = self._load_or_distribute(candidates)
 
         lay = QVBoxLayout(self)
+
+        # โหมดประวัติ: บอกชัด ๆ ว่าไม่ใช่คิวจริง + ปุ่มนำชุดนี้ไปใช้เป็นคิวปัจจุบัน
+        self.history_bar = None
+        if self._history_edit_time:
+            self.history_bar = QWidget()
+            hb = QHBoxLayout(self.history_bar)
+            hb.setContentsMargins(0, 0, 0, 0)
+            warn = QLabel("⚠️ นี่คือ 'ประวัติ' ไม่ใช่คิวปัจจุบัน — บันทึกที่นี่ Export จะไม่เปลี่ยน")
+            warn.setStyleSheet(
+                "color:#92400e;background:#fef3c7;border:1px solid #f59e0b;border-radius:4px;"
+                "padding:6px 10px;font-size:13px;font-weight:700;")
+            hb.addWidget(warn, 1)
+            btn_use = QPushButton("✅ ใช้ชุดนี้เป็นคิวปัจจุบัน")
+            btn_use.setStyleSheet(
+                "QPushButton{padding:6px 14px;border:none;border-radius:4px;"
+                "background:#d97706;color:white;font-size:12px;font-weight:700;}"
+                "QPushButton:hover{background:#b45309;}")
+            btn_use.clicked.connect(self._use_history_as_current)
+            hb.addWidget(btn_use)
+            lay.addWidget(self.history_bar)
 
         head = QLabel(
             f"กระจายรายการที่ยังไม่จ่ายลงแต่ละวัน — วงเงิน "
@@ -1064,9 +1090,66 @@ class QueuePlanDialog(QDialog):
             except Exception:
                 pass
 
-        self._auto_import_tiers()
-        # auto-save ให้ saved plan ตรงกับที่แสดง (export จะได้ตรงกัน)
+        # เฉพาะตอนยังไม่มีคิว: เติมย่อย/ด่วนอัตโนมัติ แล้วบันทึกเป็นคิวตั้งต้น
+        # มีคิวอยู่แล้ว (หรือดูประวัติ) = เปิดดูเฉย ๆ ไม่เติม ไม่บันทึกทับ
+        if self._fresh_plan:
+            self._auto_import_tiers()
+            self._persist_plan()
+        self._baseline = self._signature()
+        self._render()
+        self._update_buttons()
+
+    @staticmethod
+    def _tag_tier(e):
+        """ติดป้าย ย่อย/ด่วน ตามประเภทของบิล"""
+        tier = expense_tiers.get_tier(_exp_id(e), _amount(e), _vendor(e))
+        if tier == expense_tiers.TIER_URGENT:
+            e["_tier_tag"] = "รายการด่วน"
+        elif tier == expense_tiers.TIER_SMALL:
+            e["_tier_tag"] = "รายการย่อย"
+
+    def _signature(self):
+        return ([[_exp_id(e) for e in g] for g in self._days],
+                [d.isoformat() for d in self._day_dates()])
+
+    def _use_history_as_current(self):
+        """นำการจัดเรียงจากประวัติไปใช้เป็นคิวปัจจุบัน (มีผลกับ Export และทุกเครื่อง)"""
+        today = date.today()
+        kept, skipped = [], 0
+        for grp, d in zip(self._days, self._day_dates()):
+            ok = []
+            for e in grp:
+                if e.get("_history_only") or self._blocked_reason(e):
+                    skipped += 1
+                else:
+                    ok.append(e)
+            if ok:
+                kept.append((ok, d))
+        if not kept:
+            QMessageBox.information(self, "ใช้ไม่ได้",
+                "ไม่มีรายการที่ยังจ่ายได้ในประวัตินี้ (จ่ายแล้ว/ไม่อนุมัติ/ไม่พบในข้อมูลที่ดึงมา)")
+            return
+        n = sum(len(g) for g, _ in kept)
+        msg = (f"จะแทนที่คิวปัจจุบันด้วยชุดนี้ {len(kept)} วัน {n} รายการ\n"
+               "มีผลกับทุกเครื่อง และ Export จะใช้ชุดนี้")
+        if skipped:
+            msg += f"\n\nข้าม {skipped} รายการ (จ่ายแล้ว/ไม่อนุมัติ/ไม่พบในข้อมูล)"
+        if QMessageBox.question(self, "ใช้เป็นคิวปัจจุบัน", msg + "\n\nยืนยัน?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Yes:
+            return
+        self._history_edit_time = None
+        self._days = [g for g, _ in kept]
+        # วันที่ที่ผ่านมาแล้วไม่เอามาใช้ — ให้นับใหม่จากวันนี้
+        self._day_dates_override = {i: d.isoformat() for i, (_g, d) in enumerate(kept) if d >= today}
         self._persist_plan()
+        candidates = [e for e in self._all_bills() if not self._blocked_reason(e)]
+        self._day_dates_override = {}
+        self._days = self._load_or_distribute(candidates)
+        self._baseline = self._signature()
+        self.history_bar.hide()
+        self.setWindowTitle("📋 ตารางคิวจ่าย (หลายวัน)")
+        self.lbl_saved.setText("💾 ใช้ชุดจากประวัติเป็นคิวปัจจุบันแล้ว")
         self._render()
         self._update_buttons()
 
@@ -1139,7 +1222,8 @@ class QueuePlanDialog(QDialog):
             except Exception:
                 pass
 
-        if not (saved and saved.get("days")):
+        self._fresh_plan = not (saved and saved.get("days"))
+        if self._fresh_plan:
             # ไม่มี saved plan → แยก tier ก่อนแล้วจัดเฉพาะ normal
             classified = expense_tiers.classify_expenses(candidates, amount_fn=_amount, vendor_fn=_vendor)
             self._small_items = classified.get("small", [])
@@ -1171,14 +1255,16 @@ class QueuePlanDialog(QDialog):
         self._small_items = classified.get("small", [])
         self._urgent_items = classified.get("urgent", [])
         new_normal = classified.get("normal", [])
-        if new_normal:
-            days.extend(self._distribute(new_normal))
-        days = [g for g in days if g] or [[]]
-        self._saved_at = saved.get("saved_at", "")
         saved_dates = saved.get("dates") or []
-        self._day_dates_override = {
-            i: iso for i, iso in enumerate(saved_dates) if iso}
-        return days
+        pairs = [(g, saved_dates[i] if i < len(saved_dates) else None)
+                 for i, g in enumerate(days)]
+        pairs = [(g, d) for g, d in pairs if g]     # ตัดวันว่างพร้อมวันที่ของมัน
+        days = [g for g, _ in pairs]
+        self._day_dates_override = {i: d for i, (_g, d) in enumerate(pairs) if d}
+        if new_normal:
+            days.extend(g for g in self._distribute(new_normal) if g)
+        self._saved_at = saved.get("saved_at", "")
+        return days or [[]]
 
     # ── การกระจายรายการ ──
     def _distribute(self, candidates):
@@ -2321,6 +2407,7 @@ class QueuePlanDialog(QDialog):
             if not ok:   # หาอันเดิมไม่เจอ (ถูกลบ) → ค่อยสร้างใหม่
                 activity_log.log_queue(detail, items=items)
             self._saved_at = datetime.now().isoformat(timespec="seconds")
+            self._baseline = self._signature()
             return len(items)
 
         now_iso = datetime.now().isoformat(timespec="seconds")
@@ -2330,6 +2417,7 @@ class QueuePlanDialog(QDialog):
         self._saved_at = now_iso
         activity_log.log_queue(detail, items=items)
         activity_log.log("บันทึกคิว", f"{n_days} วัน {len(items)} รายการ")
+        self._baseline = self._signature()
         return len(items)
 
     def _save_queue(self):
@@ -2337,6 +2425,12 @@ class QueuePlanDialog(QDialog):
         n_days = len([g for g in self._days if g])
         ts = datetime.now().strftime("%d/%m %H:%M:%S")
         self.lbl_saved.setText(f"💾 บันทึกล่าสุด {ts}")
+        if self._history_edit_time:
+            QMessageBox.warning(self, "บันทึกประวัติแล้ว (คิวปัจจุบันไม่เปลี่ยน)",
+                f"บันทึกลงประวัติ {n_days} วัน • {n_items} รายการ\n\n"
+                "คิวปัจจุบันและ Export ยังเป็นชุดเดิม\n"
+                "ถ้าต้องการใช้ชุดนี้ ให้กด '✅ ใช้ชุดนี้เป็นคิวปัจจุบัน'")
+            return
         QMessageBox.information(self, "✅ บันทึกคิวแล้ว",
             f"บันทึกการจัดเรียงคิว {n_days} วัน • {n_items} รายการ\n"
             f"เวลา {ts}\n\n"
@@ -2369,10 +2463,16 @@ class QueuePlanDialog(QDialog):
             "• สถานะในหน้าหลักจะเป็น 'จ่ายแล้วรออัพเดต'")
 
     def closeEvent(self, ev):
-        """บังคับบันทึกคิวก่อนปิดหน้าต่าง (ทั้งปุ่มปิดและกากบาท)"""
-        r = QMessageBox.question(self, "💾 บันทึกคิวก่อนปิด",
-            "ต้องการบันทึกการจัดคิวก่อนปิดหรือไม่?\n\n"
-            "• บันทึก = เก็บการจัดเรียงไว้ (เปิดใหม่ยังอยู่)\n"
+        """ถามบันทึกก่อนปิดเฉพาะเมื่อมีการแก้ (ทั้งปุ่มปิดและกากบาท) — แค่เปิดดูจะไม่บันทึก"""
+        if self._signature() == self._baseline:
+            ev.accept()
+            return
+        r = QMessageBox.question(self,
+            "💾 บันทึกประวัติก่อนปิด" if self._history_edit_time else "💾 บันทึกคิวก่อนปิด",
+            ("บันทึกการแก้ไขลง 'ประวัติ' หรือไม่? (คิวปัจจุบันไม่เปลี่ยน)\n\n"
+             if self._history_edit_time else
+             "ต้องการบันทึกการจัดคิวก่อนปิดหรือไม่?\n\n")
+            + "• บันทึก = เก็บการจัดเรียงไว้ (เปิดใหม่ยังอยู่)\n"
             "• ไม่บันทึก = ปิดโดยไม่เก็บการเปลี่ยนแปลงล่าสุด",
             QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
             | QMessageBox.StandardButton.Cancel,
@@ -5603,6 +5703,7 @@ class QueueTab(QWidget):
     def _days_saved_or_distribute(self, pool):
         """ถ้ามีการจัดเรียงที่บันทึกในตารางคิว → ใช้อันนั้น (Export ตรงกับตารางคิว)
         รวม 'วันจ่ายที่ผู้ใช้กำหนดเอง' (dates) ที่บันทึกไว้ด้วย — ไม่งั้นกระจายอัตโนมัติ"""
+        self._export_unplaced = 0
         saved = queue_plan.load_plan()
         if saved and saved.get("days"):
             by_id = {_exp_id(e): e for e in pool}
@@ -5624,7 +5725,15 @@ class QueueTab(QWidget):
                     used.add(i)
                 sd = saved_dates[idx] if idx < len(saved_dates) else None
                 pairs.append((grp, sd))
-            leftover = [e for e in pool if _exp_id(e) not in used]
+            # บิลใหม่นอกคิว: ต่อท้ายเฉพาะรายการปกติ (เหมือนหน้าจอ)
+            # ย่อย/ด่วน ที่ยังไม่ได้ใส่วัน ไม่รวมใน Export
+            rest = [e for e in pool if _exp_id(e) not in used]
+            leftover = expense_tiers.classify_expenses(
+                rest, amount_fn=_amount, vendor_fn=_vendor).get("normal", [])
+            self._export_unplaced = len(rest) - len(leftover)
+            for e in pool:
+                if _exp_id(e) not in used:
+                    e.pop("_tier_tag", None)
             if leftover:
                 for d in distribute_into_days(leftover, self._daily_limit):
                     pairs.append((d["items"], None))
@@ -5692,11 +5801,13 @@ class QueueTab(QWidget):
         """เตรียมข้อมูลสำหรับ Export (ใช้ร่วม PDF/Excel/Link)
         คืน (days, exps) หรือ None ถ้ายกเลิก/ไม่มีข้อมูล"""
         from PyQt6.QtWidgets import QInputDialog
+        self._sync_now()    # ดึงคิวล่าสุดจากเครื่องอื่นก่อน
         assignments = load_brands()
-        # ใช้ทั้งหมดที่ยังไม่จ่าย (ไม่รวมที่ Mark รออัพเดต) เพื่อให้ตรงกับตารางคิว
+        # ใช้ทั้งหมดที่ยังไม่จ่าย (ไม่รวมรออัพเดต/ไม่อนุมัติ) ให้ตรงกับตารางคิว
         pool = [e for e in self._expenses
                 if not _is_paid(e) and _amount(e) > 0
-                and not paid_pending.is_pending(_exp_id(e))]
+                and not paid_pending.is_pending(_exp_id(e))
+                and not rejected.is_rejected(_exp_id(e))]
         if not pool:
             QMessageBox.information(self, "ไม่มีรายการ",
                 "ไม่มีรายการให้ export — กด 🔄 รีเฟรช ดึงข้อมูลก่อนครับ")
@@ -5720,7 +5831,9 @@ class QueueTab(QWidget):
         n, ok = QInputDialog.getInt(
             self, "Export คิวจ่ายกี่วัน?",
             f"คิวจ่ายทั้งหมดจัดได้ {maxd} วัน (จากรายการที่ยังไม่จ่ายทั้งหมด)\n"
-            f"ต้องการ export กี่วัน?",
+            + (f"(ย่อย/ด่วน ที่ยังไม่ได้ใส่วัน {self._export_unplaced} รายการ ไม่รวมในไฟล์)\n"
+               if self._export_unplaced else "")
+            + f"ต้องการ export กี่วัน?",
             min(3, maxd), 1, maxd)
         if not ok:
             return None
@@ -9752,7 +9865,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.6.4"
+APP_VERSION = "4.6.5"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -9884,6 +9997,17 @@ QToolTip { background-color: #2a2b2e; color: #e8eaed; border: 1px solid #5f6368;
 """
 
 CHANGELOG = [
+    {
+        "version": "4.6.5",
+        "date": "26/11/2569",
+        "title": "แก้คิวถูกบันทึกทับเอง และ Export ไม่ตรงกับที่จัด",
+        "items": [
+            "เปิดดูตารางคิวเฉย ๆ จะไม่บันทึกทับคิวแล้ว — บันทึกเมื่อกดบันทึก (ปิดหน้าต่างจะถามเฉพาะเมื่อมีการแก้)",
+            "คิวที่จัดไว้แล้วจะไม่ถูกเติมรายการย่อย/ด่วนเอง รายการใหม่รออยู่ในรายจ่ายย่อย/ด่วนให้เลือกใส่",
+            "หน้าแก้ไขจากประวัติมีป้ายเตือนว่าไม่ใช่คิวปัจจุบัน และมีปุ่ม 'ใช้ชุดนี้เป็นคิวปัจจุบัน'",
+            "Export ดึงคิวล่าสุดก่อน ไม่รวมรายการไม่อนุมัติ และไม่รวมย่อย/ด่วนที่ยังไม่ได้ใส่วัน",
+        ],
+    },
     {
         "version": "4.6.4",
         "date": "26/11/2569",
