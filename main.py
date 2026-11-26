@@ -1126,6 +1126,8 @@ class QueuePlanDialog(QDialog):
     def _load_or_distribute(self, candidates):
         """ถ้ามีการจัดเรียงที่บันทึกไว้ → ใช้อันนั้น (รายการใหม่ที่ยังไม่จัด ค่อยกระจายเพิ่ม)
         แยก ย่อย/ด่วน ออกก่อนเสมอ"""
+        for e in candidates:
+            e.pop("_tier_tag", None)
         saved = queue_plan.load_plan()
         if saved and saved.get("saved_at"):
             try:
@@ -1149,28 +1151,25 @@ class QueuePlanDialog(QDialog):
         saved_ids = {i for day_ids in saved["days"] for i in day_ids}
         used = set()
         days = []
-        newly_urgent = []
-        newly_small = []
         for day_ids in saved["days"]:
             grp = []
             for i in day_ids:
                 if i in by_id and i not in used:
                     e = by_id[i]
-                    amt = _amount(e)
-                    tier = expense_tiers.get_tier(i, amt, _vendor(e))
+                    # ย่อย/ด่วน ที่บันทึกไว้ในวันไหน อยู่วันนั้นต่อ (ติดป้ายให้) — ไม่ดึงออกจากคิว
+                    tier = expense_tiers.get_tier(i, _amount(e), _vendor(e))
                     if tier == expense_tiers.TIER_URGENT:
-                        newly_urgent.append(e)
+                        e["_tier_tag"] = "รายการด่วน"
                     elif tier == expense_tiers.TIER_SMALL:
-                        newly_small.append(e)
-                    else:
-                        grp.append(e)
+                        e["_tier_tag"] = "รายการย่อย"
+                    grp.append(e)
                 used.add(i)
             days.append(grp)
         # รายการใหม่ที่ไม่อยู่ใน saved plan → แยก tier แล้วจัดต่อท้าย
         leftover = [e for e in candidates if _exp_id(e) not in saved_ids]
         classified = expense_tiers.classify_expenses(leftover, amount_fn=_amount, vendor_fn=_vendor)
-        self._small_items = classified.get("small", []) + newly_small
-        self._urgent_items = classified.get("urgent", []) + newly_urgent
+        self._small_items = classified.get("small", [])
+        self._urgent_items = classified.get("urgent", [])
         new_normal = classified.get("normal", [])
         if new_normal:
             days.extend(self._distribute(new_normal))
@@ -1507,39 +1506,89 @@ class QueuePlanDialog(QDialog):
         if moved:
             self.lbl_hint.setText(f"ย้าย {moved} รายการแล้ว")
 
+    @staticmethod
+    def _norm_doc(text) -> str:
+        return (text or "").upper().replace(" ", "")
+
+    def _all_bills(self) -> list:
+        """บิลทั้งหมดที่โปรแกรมดึงมา (จากหน้าคิว) — ใช้หาเอกสารที่ยังไม่อยู่ในคิว"""
+        w = self.parent()
+        while w is not None:
+            ex = getattr(w, "_expenses", None)
+            if ex:
+                return list(ex)
+            w = w.parent()
+        return []
+
+    def _blocked_reason(self, e) -> str:
+        """เหตุผลที่บิลนี้เอาเข้าคิวไม่ได้ ('' = เข้าได้)"""
+        if _is_paid(e):
+            return "จ่ายแล้วใน FlowAccount"
+        if paid_pending.is_pending(_exp_id(e)):
+            return "ถูก Mark 'จ่ายแล้วรออัพเดต'"
+        if rejected.is_rejected(_exp_id(e)):
+            return "อยู่ในรายการไม่อนุมัติ"
+        if _amount(e) <= 0:
+            return "ยอดเงินเป็น 0"
+        return ""
+
+    def _find_doc_everywhere(self, q: str):
+        """หาเลขเอกสารทุกกอง → (ที่อยู่, expense) | (None, รายการที่ตรงบางส่วนหลายใบ/ว่าง)
+        ที่อยู่: 'queue' | 'small' | 'urgent' | 'other' — ตรงเป๊ะก่อน แล้วค่อยจับบางส่วน"""
+        pools = [("queue", [e for g in self._days for e in g]),
+                 ("small", self._small_items), ("urgent", self._urgent_items),
+                 ("other", self._all_bills())]
+        seen, hits = set(), []
+        for where, items in pools:
+            for e in items:
+                eid = _exp_id(e)
+                doc = self._norm_doc(_doc_no(e))
+                if not doc or eid in seen or q not in doc:
+                    continue
+                seen.add(eid)
+                hits.append((doc == q, where, e))
+        exact = [h for h in hits if h[0]]
+        if exact:
+            return exact[0][1], exact[0][2]
+        if len(hits) == 1:
+            return hits[0][1], hits[0][2]
+        return None, [h[2] for h in hits]
+
     def _manual_move_by_doc(self):
         """จัดคิวเอง: พิมพ์เลขเอกสาร EXP/PO แล้วย้าย/ใส่ไปวันที่ที่ระบุ"""
-        q = (self.ed_doc.text() or "").strip().upper().replace(" ", "")
+        q = self._norm_doc(self.ed_doc.text().strip())
         if not q:
             self.lbl_manual.setText("⚠️ พิมพ์เลขเอกสารก่อน")
             return
-        # หาในรายการทั้งหมด (ตรงเป๊ะก่อน ไม่งั้นค่อยจับบางส่วน)
-        found_id = None
-        exact = None
-        partial = []
-        for grp in self._days:
-            for e in grp:
-                doc = (_doc_no(e) or "").upper().replace(" ", "")
-                if not doc:
-                    continue
-                if doc == q:
-                    exact = _exp_id(e)
-                elif q in doc:
-                    partial.append(_exp_id(e))
-        found_id = exact or (partial[0] if len(partial) == 1 else None)
-        if not found_id:
-            if len(partial) > 1:
+        where, e = self._find_doc_everywhere(q)
+        if where is None:
+            if e:
                 self.lbl_manual.setText(f"⚠️ เจอหลายรายการที่ตรงกับ '{q}' — พิมพ์ให้ครบ")
             else:
-                self.lbl_manual.setText(f"❌ ไม่พบเอกสาร '{q}' ในคิว")
+                self.lbl_manual.setText(
+                    f"❌ ไม่พบเอกสาร '{q}' ในข้อมูลที่ดึงมา — เพิ่มจำนวนรายการที่ดึงในตั้งค่า แล้วกดรีเฟรช")
             return
+        if where == "other":
+            why = self._blocked_reason(e)
+            if why:
+                self.lbl_manual.setText(f"❌ ใส่ '{_doc_no(e)}' ไม่ได้ — {why}")
+                return
 
         target = self.spin_day.value() - 1
-        di, ii = self._locate_exp(found_id)
-        if di is None:
-            self.lbl_manual.setText("❌ ไม่พบรายการ")
-            return
-        e = self._days[di].pop(ii)
+        eid = _exp_id(e)
+        if where == "queue":
+            di, ii = self._locate_exp(eid)
+            e = self._days[di].pop(ii)
+        else:
+            self._small_items = [x for x in self._small_items if _exp_id(x) != eid]
+            self._urgent_items = [x for x in self._urgent_items if _exp_id(x) != eid]
+            tier = expense_tiers.get_tier(eid, _amount(e), _vendor(e))
+            if tier == expense_tiers.TIER_URGENT:
+                e["_tier_tag"] = "รายการด่วน"
+            elif tier == expense_tiers.TIER_SMALL:
+                e["_tier_tag"] = "รายการย่อย"
+            else:
+                e.pop("_tier_tag", None)
         while target >= len(self._days):
             self._days.append([])
         self._days[target].append(e)
@@ -1547,10 +1596,32 @@ class QueuePlanDialog(QDialog):
         self._keep_checked = self._checked_exp_ids()
         self._render()
         self._update_buttons()
+        src = {"queue": "ย้าย", "small": "ใส่จากรายจ่ายย่อย", "urgent": "ใส่จากรายจ่ายด่วน",
+               "other": "เพิ่ม"}[where]
+        di, _ = self._locate_exp(eid)
         self.lbl_manual.setText(
-            f"✅ ย้าย {_doc_no(e)} ({_vendor(e)}) ไปวันที่ {target + 1} แล้ว")
+            f"✅ {src}: {_doc_no(e)} ({_vendor(e)}) → วันที่ {(di or 0) + 1} — อย่าลืมกดบันทึกคิว")
         self.ed_doc.clear()
         self.ed_doc.setFocus()
+
+    def _where_not_in_queue(self, terms) -> str:
+        """ค้นในคิวไม่เจอ → บอกว่าเอกสาร/ชื่อนั้นไปอยู่ที่ไหน"""
+        def _hit(e):
+            blob = f"{_vendor(e)} {_doc_no(e)}".lower()
+            return any(t in blob for t in terms)
+
+        for label, items in (("รายจ่ายย่อย 🔵", self._small_items), ("รายจ่ายด่วน 🔴", self._urgent_items)):
+            found = [e for e in items if _hit(e)]
+            if found:
+                return (f"⚠️ ยังไม่อยู่ในวันคิว — อยู่ใน{label} {len(found)} รายการ ({_doc_no(found[0])}) "
+                        "พิมพ์เลขในช่อง 'จัดคิวเอง' เพื่อใส่เข้าวันได้")
+        found = [e for e in self._all_bills() if _hit(e)]
+        if found:
+            why = self._blocked_reason(found[0])
+            if why:
+                return f"❌ {_doc_no(found[0])} ไม่อยู่ในคิว — {why}"
+            return (f"⚠️ {_doc_no(found[0])} ยังไม่อยู่ในคิว — พิมพ์เลขในช่อง 'จัดคิวเอง' เพื่อใส่เข้าวันได้")
+        return "❌ ไม่พบในข้อมูลที่ดึงมา — เพิ่มจำนวนรายการที่ดึงในตั้งค่า แล้วกดรีเฟรช"
 
     def _search_in_plan(self, text):
         """ค้นหารายการในคิว (ชื่อ/เลขเอกสาร บางส่วน หลายคำ) → ไฮไลต์ + เลื่อนไปหา"""
@@ -1581,7 +1652,7 @@ class QueuePlanDialog(QDialog):
             self.tree.scrollToItem(first)
             self.lbl_search.setText(f"🔍 เจอ {n} รายการ (ไฮไลต์สีน้ำเงิน)")
         else:
-            self.lbl_search.setText("❌ ไม่เจอในคิว — อาจจ่ายแล้ว / ไม่อนุมัติ / คนละบริษัท")
+            self.lbl_search.setText(self._where_not_in_queue(terms))
 
     def _on_double_click(self, item, _col):
         data = item.data(0, Qt.ItemDataRole.UserRole)
@@ -9681,7 +9752,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.6.3"
+APP_VERSION = "4.6.4"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -9813,6 +9884,16 @@ QToolTip { background-color: #2a2b2e; color: #e8eaed; border: 1px solid #5f6368;
 """
 
 CHANGELOG = [
+    {
+        "version": "4.6.4",
+        "date": "26/11/2569",
+        "title": "จัดคิว: ค้นเลขเอกสารเจอทุกกอง + รายการย่อย/ด่วนอยู่วันเดิมหลังบันทึก",
+        "items": [
+            "ช่อง 'จัดคิวเอง' หาเลขเอกสารได้ทั้งในคิว รายจ่ายย่อย รายจ่ายด่วน และบิลที่ยังไม่อยู่ในคิว แล้วใส่เข้าวันที่เลือกได้เลย",
+            "ช่อง 'ค้นหาในคิว' ถ้าไม่เจอ จะบอกว่าเอกสารอยู่ที่ไหน/ทำไมเข้าคิวไม่ได้ (จ่ายแล้ว ไม่อนุมัติ รออัพเดต)",
+            "แก้: รายการย่อย/ด่วนที่วางไว้ในวันแล้วบันทึกคิว เคยถูกดึงออกไปกระจายใหม่ตอนเปิดอีกครั้ง — ตอนนี้อยู่วันเดิม",
+        ],
+    },
     {
         "version": "4.6.3",
         "date": "17/11/2569",
