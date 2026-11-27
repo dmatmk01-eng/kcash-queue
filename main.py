@@ -6805,35 +6805,39 @@ class SensitiveEyeWidget(QWidget):
 
 
 class SlipPDFWorker(QThread):
-    """อ่านไฟล์สลิป PDF แบบ background — ไม่ให้ UI ค้างระหว่างโหลด"""
+    """อ่านไฟล์สลิป PDF (หลายไฟล์ได้) แบบ background — ไม่ให้ UI ค้างระหว่างโหลด"""
     done  = pyqtSignal(list)
     error = pyqtSignal(str)
-    def __init__(self, path, parent=None):
+    def __init__(self, paths, parent=None):
         super().__init__(parent)
-        self.path = path
+        self.paths = paths
+        self.notes = []      # เรื่องที่ต้องแจ้งผู้ใช้ (ไฟล์อ่านไม่ได้/รายการซ้ำ)
     def run(self):
         try:
-            records = parse_payment_report(self.path)
+            from bank_slip import parse_payment_reports
+            records, self.notes = parse_payment_reports(self.paths)
             self.done.emit(records)
         except Exception as exc:
             self.error.emit(str(exc))
 
 
 class SlipImageWorker(QThread):
-    """อ่านสลิปจาก 'รูปภาพ' หลายไฟล์ด้วย OCR (Windows OCR) + PDF (ถ้ามี) — background
-    บัญชีเขียนแท็ก 'ai#EXP<เลข>' ในรูป → อ่านเลข EXP ไปจับคู่แบบเลขตรง"""
+    """อ่านสลิปจาก 'รูปภาพ' หลายไฟล์ด้วย OCR + PDF (ถ้ามี) — background
+    ลำดับจับคู่: มีแท็ก ai#EXP<เลข> ในรูป → จับตามเลขก่อน / ไม่มีหรือหาเลขไม่เจอ → ชื่อ+ยอด+วันที่"""
     done  = pyqtSignal(list)
     error = pyqtSignal(str)
-    def __init__(self, img_paths, pdf_path=None, parent=None):
+    def __init__(self, img_paths, pdf_paths=None, parent=None):
         super().__init__(parent)
         self.img_paths = img_paths
-        self.pdf_path = pdf_path
+        self.pdf_paths = pdf_paths or []
+        self.notes = []
     def run(self):
         try:
             import slip_ocr
+            from bank_slip import parse_payment_reports
             recs = []
-            if self.pdf_path:                       # เผื่อเลือก PDF ปนกับรูป
-                recs.extend(parse_payment_report(self.pdf_path))
+            if self.pdf_paths:                      # เผื่อเลือก PDF ปนกับรูป
+                recs, self.notes = parse_payment_reports(self.pdf_paths)
             for p in self.img_paths:
                 recs.append(slip_ocr.parse_slip_image(p))
             self.done.emit(recs)
@@ -6971,17 +6975,36 @@ class SlipManualMatchDialog(QDialog):
     (ชื่อในสลิปอาจไม่ตรงกับชื่อในระบบ → ผู้ใช้ดูวันที่/ชื่อแล้วเลือกใบที่ถูกเอง)"""
     COLS = ["เลขเอกสาร", "ผู้รับเงิน / Vendor", "ยอด (บาท)", "วันที่เอกสาร", "ครบกำหนด", "ห่างจากวันโอน"]
 
-    def __init__(self, slip, expenses, parent=None):
+    SKIP = 2     # ผลลัพธ์เมื่อกด 'ข้ามใบนี้' (โหมดเลือกทีละใบ)
+
+    def __init__(self, slip, expenses, parent=None, progress=None, used_ids=None):
         super().__init__(parent)
-        self.setWindowTitle("จับคู่ค่าใช้จ่ายเอง")
-        self.resize(780, 540)
+        self.setWindowTitle(f"สลิปที่ยังไม่เจอคู่ {progress[0]}/{progress[1]} — เลือกเอกสาร"
+                            if progress else "จับคู่ค่าใช้จ่ายเอง")
+        png = slip.get("_png")
+        self.resize(1140 if png else 780, 600 if png else 540)
+        self._used = used_ids or set()
         self.expenses = expenses
         self.picked = None
         self._slip = slip
         amt = slip.get("amount") or 0
         self._amt = amt
 
-        lay = QVBoxLayout(self)
+        outer = QHBoxLayout(self)
+        if png:   # โชว์รูปสลิปด้านซ้าย จะได้เทียบชื่อ/ยอดได้เลย
+            from PyQt6.QtGui import QPixmap
+            from PyQt6.QtWidgets import QScrollArea
+            pix = QPixmap()
+            pix.loadFromData(png)
+            pic = QLabel()
+            pic.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+            if not pix.isNull():
+                pic.setPixmap(pix.scaledToWidth(330, Qt.TransformationMode.SmoothTransformation))
+            area = QScrollArea(); area.setWidget(pic); area.setWidgetResizable(True)
+            area.setFixedWidth(356)
+            outer.addWidget(area)
+        lay = QVBoxLayout()
+        outer.addLayout(lay, 1)
         when = fmt_date(slip.get("pay_date", "")) or "-"
         if slip.get("pay_time"):
             when += f" {slip['pay_time']} น."
@@ -6996,7 +7019,8 @@ class SlipManualMatchDialog(QDialog):
                           "กรุณาเช็คชื่อ/วันที่แล้วเลือกใบที่ถูกต้อง")
             warn.setStyleSheet("background:#ffedd5;color:#9a3412;border-radius:4px;padding:5px 10px;")
         else:
-            warn = QLabel("ไม่พบเอกสารที่ยอดตรงกับสลิปนี้ — ค้นหาจากชื่อ/เลขเอกสารด้านล่าง")
+            warn = QLabel("ไม่พบเอกสารที่ยอดตรงกับสลิปนี้ — ใบที่ชื่อคล้ายอยู่บนสุด "
+                          "หรือค้นหาจากชื่อ/เลขเอกสารด้านล่าง")
             warn.setStyleSheet("background:#fee2e2;color:#991b1b;border-radius:4px;padding:5px 10px;")
         warn.setWordWrap(True)
         lay.addWidget(warn)
@@ -7026,16 +7050,29 @@ class SlipManualMatchDialog(QDialog):
         self.tbl.cellDoubleClicked.connect(lambda *_: self._ok())
         lay.addWidget(self.tbl, 1)
 
-        # เรียง: ยอดตรงก่อน (วันที่ใกล้สุดก่อน) → ที่เหลือเรียงตามยอดต่าง/วันที่
+        # เรียง: ยอดตรง (วันที่ใกล้สุดก่อน) → ชื่อคล้าย → ที่เหลือเรียงตามยอดต่าง
+        from bank_slip import _name_score
+        name = slip.get("recv_name") or ""
+
         def sort_key(e):
             diff = abs(_amount(e) - amt)
-            return (diff > 0.01, _slip_date_dist(slip, e) if diff <= 0.01 else diff,
-                    _slip_date_dist(slip, e))
+            if diff <= 0.01:
+                return (0, _slip_date_dist(slip, e), 0)
+            if name and _name_score(name, _vendor(e) or "") >= 0.55:
+                return (1, diff, _slip_date_dist(slip, e))
+            return (2, diff, _slip_date_dist(slip, e))
         self._sorted = sorted(expenses, key=sort_key)
         self._cur = []
         self._refill()
 
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("✅ จับคู่ใบที่เลือก")
+        bb.button(QDialogButtonBox.StandardButton.Cancel).setText(
+            "ปิด (เลือกทีหลัง)" if progress else "ยกเลิก")
+        if progress:
+            skip = bb.addButton("ข้ามใบนี้ ➡️", QDialogButtonBox.ButtonRole.ActionRole)
+            skip.setAutoDefault(False)
+            skip.clicked.connect(lambda *_: self.done(self.SKIP))
         bb.accepted.connect(self._ok); bb.rejected.connect(self.reject)
         lay.addWidget(bb)
 
@@ -7056,19 +7093,26 @@ class SlipManualMatchDialog(QDialog):
             self.tbl.insertRow(r)
             dd = _slip_date_dist(self._slip, e)
             is_eq = abs(_amount(e) - self._amt) <= 0.01
-            vals = [_doc_no(e), _vendor(e) or "-", fmt_amount(_amount(e)),
+            mark = ((" • เลือกแล้ว" if _exp_id(e) in self._used else "")
+                    + (" • จ่ายแล้ว" if _is_paid(e) else ""))
+            vals = [_doc_no(e) + mark, _vendor(e) or "-", fmt_amount(_amount(e)),
                     fmt_date((e.get("publishedOn") or "")[:10]) if e.get("publishedOn") else "-",
                     fmt_date(_due(e)[:10]) if _due(e) else "-",
                     (f"{dd} วัน" if dd < 9999 else "-")]
             for c, v in enumerate(vals):
                 it = QTableWidgetItem(v)
+                it.setToolTip(v)
                 if c == 2:
                     it.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 if is_eq:
                     it.setBackground(QBrush(C_MATCHED if dd <= 7 else C_DUE_SOON))
                 self.tbl.setItem(r, c, it)
-        if self._cur:
+        # เลือกแถวแรกให้เฉพาะเมื่อยอดตรง — ยอดไม่ตรงต้องคลิกเลือกเอง กันกด Enter แล้วจับผิดใบ
+        if self._cur and abs(_amount(self._cur[0]) - self._amt) <= 0.01:
             self.tbl.selectRow(0)
+        else:
+            self.tbl.clearSelection()
+            self.tbl.setCurrentCell(-1, -1)
 
     def _ok(self):
         i = self.tbl.currentRow()
@@ -7206,6 +7250,10 @@ class SlipMatchTab(QWidget):
         self._style(self.btn_promote, "#16a34a")
         self.btn_promote.clicked.connect(self._promote_unmatched)
         bar_un.addWidget(self.btn_promote)
+        self.btn_pick_all = QPushButton("🎯 เลือกคู่ทีละใบ")
+        self._style(self.btn_pick_all, "#ea580c")
+        self.btn_pick_all.clicked.connect(self._pick_pending)
+        bar_un.addWidget(self.btn_pick_all)
         self.btn_step2 = QPushButton("🔁 จับคู่รอบ 2 (ตามยอดเงิน)")
         self._style(self.btn_step2, "#0d9488")
         self.btn_step2.clicked.connect(self._match_step2_by_amount)
@@ -7309,15 +7357,18 @@ class SlipMatchTab(QWidget):
         dlg = LoadingDialog(msg, self)
         dlg.set_indeterminate(msg)
         if use_ocr:
-            self._slip_worker = SlipImageWorker(imgs, pdfs[0] if pdfs else None, self)
+            self._slip_worker = SlipImageWorker(imgs, pdfs, self)
         else:
-            self._slip_worker = SlipPDFWorker(pdfs[0], self)
+            self._slip_worker = SlipPDFWorker(pdfs, self)
         self._slip_worker.done.connect(
             lambda recs: (dlg.accept(), self._on_pdf_loaded(label, recs)))
         self._slip_worker.error.connect(
             lambda m: (dlg.reject(), self._on_pdf_error(m)))
         self._slip_worker.start()
         dlg.exec()
+        notes = getattr(self._slip_worker, "notes", None)
+        if notes:
+            QMessageBox.warning(self, "ตรวจไฟล์ที่เลือก", "\n".join(notes))
 
     def _on_pdf_loaded(self, label, records):
         self._records = records
@@ -7392,6 +7443,8 @@ class SlipMatchTab(QWidget):
         # ตัดรูปสลิปทุกแถวไว้ใน RAM เพื่อโชว์ในคอลัมน์ "รูป" (ไม่เซฟลงดิสก์)
         self._crop_slip_images()
         self._render_results()
+        if any(r["status"] != "matched" for r in self._results):
+            QTimer.singleShot(0, self._pick_pending)   # มีใบไม่เจอคู่ → ขึ้นหน้าต่างให้เลือก
 
     def _crop_slip_images(self):
         """ตัดรูปสลิปทุกแถว เก็บใน RAM (slip['_png']) — กดดูในโปรแกรมได้
@@ -8148,25 +8201,63 @@ class SlipMatchTab(QWidget):
             QMessageBox.information(self, "ยังไม่มีข้อมูล",
                 "ไปแท็บคิวจ่ายเงิน กดรีเฟรชเพื่อดึงค่าใช้จ่ายก่อน")
             return
-        dlg = SlipManualMatchDialog(res["slip"], pool, self)
+        dlg = SlipManualMatchDialog(res["slip"], pool, self, used_ids=self._used_doc_ids(res))
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.picked is not None:
-            res["expense"] = dlg.picked
-            res["status"] = "matched"
-            res["score"] = 1.0   # จับคู่เอง
-            res.pop("via", None)
-            # สอนระบบจำ: เลขบัญชีนี้ = ผู้จำหน่ายคนนี้ (บัญชียืนยันเอง = แม่นสุด)
-            try:
-                import account_memory as _am
-                _am.learn(res["slip"].get("recv_acct"),
-                          dlg.picked.get("contactName") or "")
-                _am.save()
-            except Exception:
-                pass
-            # ติ๊กให้อัตโนมัติ จะได้ตัด/แนบได้เลย
-            self._checked_slips.add(id(res))
+            self._apply_manual_pick(res, dlg.picked)
             self._render_results()
             self.status_message.emit(
                 f"จับคู่เอง: {res['slip'].get('recv_name','')} → {_slip_exp_serial(dlg.picked)}")
+
+    def _used_doc_ids(self, current=None):
+        """เอกสารที่ถูกจับคู่กับสลิปใบอื่นแล้ว"""
+        return {_exp_id(r["expense"]) for r in self._results
+                if r is not current and r["status"] == "matched" and r.get("expense")}
+
+    def _apply_manual_pick(self, res, expense):
+        res["expense"] = expense
+        res["status"] = "matched"
+        res["score"] = 1.0   # จับคู่เอง
+        res.pop("via", None)
+        res.pop("match_note", None)
+        # สอนระบบจำ: เลขบัญชีนี้ = ผู้จำหน่ายคนนี้ (บัญชียืนยันเอง = แม่นสุด)
+        try:
+            import account_memory as _am
+            _am.learn(res["slip"].get("recv_acct"), expense.get("contactName") or "")
+            _am.save()
+        except Exception:
+            pass
+        # ติ๊กให้อัตโนมัติ จะได้ตัด/แนบได้เลย
+        self._checked_slips.add(id(res))
+
+    def _pick_pending(self):
+        """ไล่ให้เลือกเอกสารทีละใบ สำหรับสลิปที่ยังไม่เจอคู่ (จับคู่ / ข้าม / ปิด)"""
+        pool = getattr(self, "_match_expenses", None) or self._expenses
+        pending = [r for r in self._results if r["status"] != "matched"]
+        if not pool or not pending:
+            QMessageBox.information(self, "ไม่มีรายการ", "ไม่มีสลิปที่ต้องเลือกคู่")
+            return
+        # รายชื่อข้อมูลลับ (ซ่อนยอด) ไม่เด้งโชว์ — ปลดล็อกในตารางก่อน หรือกดเลือกใบเองทีละรายการ
+        names = _sensitive_names()
+        queue = [r for r in pending
+                 if id(r) in self._revealed_slip_ids
+                 or not _sensitive_is_vendor(r["slip"].get("recv_name", ""), names)]
+        done = 0
+        for i, res in enumerate(queue, 1):
+            dlg = SlipManualMatchDialog(res["slip"], pool, self, progress=(i, len(queue)),
+                                        used_ids=self._used_doc_ids(res))
+            code = dlg.exec()
+            if code == SlipManualMatchDialog.SKIP:
+                continue
+            if code != QDialog.DialogCode.Accepted or dlg.picked is None:
+                break
+            self._apply_manual_pick(res, dlg.picked)
+            done += 1
+        if done:
+            self._render_results()
+        hidden = len(pending) - len(queue)
+        self.status_message.emit(
+            f"เลือกคู่เอง {done} รายการ • เหลือยังไม่เจอคู่ {len(pending) - done}"
+            + (f" (ข้อมูลลับ {hidden} รายการ ไม่แสดงอัตโนมัติ)" if hidden else ""))
 
 
 # ──────────────────── Goods Receipt Tab (ใบรับสินค้า) ────────────────────
@@ -9865,7 +9956,7 @@ class SensitiveManagerDialog(QDialog):
 
 # ──────────────────── Main Window ────────────────────
 
-APP_VERSION = "4.6.5"
+APP_VERSION = "4.7"
 
 # ──────────────────── Auto-Update (GitHub Releases) ────────────────────
 # repo ที่เก็บ release (เปลี่ยนได้ผ่าน kcash_config.json คีย์ "update_repo")
@@ -9997,6 +10088,16 @@ QToolTip { background-color: #2a2b2e; color: #e8eaed; border: 1px solid #5f6368;
 """
 
 CHANGELOG = [
+    {
+        "version": "4.7",
+        "date": "27/11/2569",
+        "title": "ตัดบิล: อ่านหลาย PDF + จับคู่ด้วยชื่อ/ยอด + หน้าต่างเลือกคู่",
+        "items": [
+            "แก้: เลือกไฟล์ PDF หลายไฟล์แล้วอ่านแค่ไฟล์แรก — ตอนนี้อ่านครบทุกไฟล์ และแจ้งถ้าไฟล์ไหนอ่านไม่ได้/มีรายการซ้ำ",
+            "รูปสลิปจับคู่: เช็คแท็ก ai#EXP ก่อน ถ้าไม่มีแท็กจับด้วยชื่อผู้รับ + ยอดเงิน + วันที่",
+            "จับคู่แล้วมีใบที่ไม่เจอ จะขึ้นหน้าต่างให้เลือกเอกสารทีละใบ พร้อมรูปสลิป (จับคู่ / ข้าม / ปิด) เปิดซ้ำได้ที่ปุ่ม 'เลือกคู่ทีละใบ'",
+        ],
+    },
     {
         "version": "4.6.5",
         "date": "26/11/2569",

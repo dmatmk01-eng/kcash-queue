@@ -19,6 +19,7 @@ Bank Slip Parser — อ่าน "รายละเอียดการชำ
     "success":     True,             # ดำเนินการสำเร็จ / หักเงินไม่สำเร็จ
 }
 """
+import os
 import re
 from datetime import datetime
 
@@ -99,6 +100,39 @@ def parse_payment_report(pdf_path: str) -> list:
     return records
 
 
+def parse_payment_reports(pdf_paths: list) -> tuple:
+    """อ่านรายงาน PDF หลายไฟล์รวมกัน → (records, notes)
+    - แต่ละแถวจำไฟล์ต้นทางไว้ใน _pdf_path (ใช้ตัดรูปให้ถูกไฟล์)
+    - รายการเดียวกันที่ซ้ำข้ามไฟล์ (เลขอ้างอิง+บัญชี+ชื่อ+ยอด ตรงกัน) เก็บครั้งเดียว กันแนบ/จ่ายซ้ำ
+    - notes = ข้อความที่ต้องแจ้งผู้ใช้ (ไฟล์ที่อ่านไม่ได้ / ไม่มีรายการ / รายการซ้ำ)"""
+    records, notes, seen = [], [], set()
+    for path in pdf_paths:
+        name = os.path.basename(path)
+        try:
+            recs = parse_payment_report(path)
+        except Exception as exc:                       # noqa: BLE001
+            notes.append(f"อ่านไฟล์ไม่ได้: {name} ({exc})")
+            continue
+        if not recs:
+            notes.append(f"ไม่พบรายการในไฟล์: {name}")
+            continue
+        keys, dup = set(), 0
+        for r in recs:
+            r["_pdf_path"] = path
+            key = ((r.get("ref"), r.get("recv_acct"), r.get("recv_name"), r.get("amount"))
+                   if r.get("ref") else None)
+            if key and key in seen:
+                dup += 1
+                continue
+            if key:
+                keys.add(key)
+            records.append(r)
+        seen |= keys
+        if dup:
+            notes.append(f"{name}: ตัดรายการที่ซ้ำกับไฟล์ก่อนหน้า {dup} รายการ")
+    return records, notes
+
+
 def crop_row_png(pdf_path: str, record: dict, scale: float = 2.5) -> bytes:
     """ตัด 'แถว' ของรายการจากหน้า PDF ออกมาเป็นรูป PNG (คืน bytes)
     ใช้ pypdfium2 render หน้า แล้วครอปตามตำแหน่ง y ของแถว
@@ -162,12 +196,17 @@ def crop_all_rows(pdf_path: str, records: list, scale: float = 2.5) -> list:
                 out[idx] = None
 
     # (ข) รายการจาก PDF → ตัดทีละแถวจากหน้า PDF (เหมือนเดิม)
-    if pdf_idxs and pdf_path:
+    by_file = defaultdict(list)
+    for idx in pdf_idxs:
+        path = records[idx].get("_pdf_path") or pdf_path
+        if path:
+            by_file[path].append(idx)
+    for path, file_idxs in by_file.items():
         import pypdfium2 as pdfium
         by_page = defaultdict(list)
-        for idx in pdf_idxs:
+        for idx in file_idxs:
             by_page[int(records[idx].get("page", 1)) - 1].append(idx)
-        pdf = pdfium.PdfDocument(pdf_path)
+        pdf = pdfium.PdfDocument(path)
         try:
             for pno, idxs in by_page.items():
                 try:
